@@ -1,13 +1,15 @@
 //
-// tests/ingress_ring_tests.cpp
-// Single-Producer / Single-Consumer stress test for the ingress Disruptor ring.
-// Built under ThreadSanitizer (see tsan.sh) -- if a single release/acquire barrier
-// is missing, TSan flags the plain slot read/write as a data race.
+// tests/spsc_ring_tests.cpp
+// ThreadSanitizer stress tests for the generic SPSC Disruptor ring (SpscRing<T>,
+// exercised here via IngressRing = SpscRing<Order>). Every path uses a deliberately
+// tiny 1024-slot ring to force heavy wraparound + full/empty cycling, so a single
+// missing release/acquire barrier surfaces as a data race on the slot memory.
 //
-// The producer stamps order.seq = i (i = 0..N-1) and pushes N orders; the consumer
-// pops N orders and asserts each order.seq == the expected running counter, strictly
-// in order. A deliberately SMALL ring forces heavy wraparound + full/empty cycling
-// so the barriers are exercised millions of times.
+// Covered:
+//   1. try_publish          -> try_consume       (single-element)
+//   2. try_publish          -> consume_batch      (batch drain)
+//   3. publish_batch(1..50) -> consume_batch      (batch publish + drain)
+// Each pushes 5,000,000 items and asserts strict monotonic seq order + zero loss.
 //
 #include "ut.hpp"
 
@@ -17,7 +19,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <random>
 #include <thread>
+#include <vector>
 
 using namespace titan;
 using namespace titan::pipeline;
@@ -163,6 +167,83 @@ TEST_CASE(spsc_batch_drain_preserves_strict_order) {
                     (unsigned long long)received.load(), (unsigned long long)N);
     } else {
         std::printf("    OK: %llu orders via consume_batch, strict in-order, ring=%zu slots\n",
+                    (unsigned long long)N, RING);
+    }
+}
+
+// Producer publishes VARIABLE-SIZE batches (1..50) via publish_batch (single
+// release-store per batch, wraparound copy, busy-spin on full); consumer drains via
+// consume_batch. Strict order + zero loss across 5M items on a 1024-slot ring stresses
+// the batch-publish barrier + wraparound under TSan. The consumer keeps draining even
+// after a mismatch (records the first) so a bug fails cleanly instead of deadlocking the
+// publish_batch producer, which busy-spins internally with no abort hook.
+TEST_CASE(spsc_batch_publish_and_drain_preserves_order) {
+    constexpr std::uint64_t N    = 5'000'000;
+    constexpr std::size_t   RING = 1u << 10;
+
+    IngressRing<RING> ring;
+
+    std::atomic<bool>          producer_done{false};
+    std::atomic<std::uint64_t> received{0};
+    std::atomic<bool>          ordering_ok{true};
+    std::atomic<std::uint64_t> bad_expected{0};
+    std::atomic<std::uint64_t> bad_got{0};
+
+    std::thread consumer([&] {
+        std::uint64_t exp = 0;
+        while (exp < N) {
+            const std::uint64_t got = ring.consume_batch([&](const Order& o) {
+                if (o.seq != exp && ordering_ok.load(std::memory_order_relaxed)) {
+                    bad_expected.store(exp,  std::memory_order_relaxed);
+                    bad_got.store(o.seq,     std::memory_order_relaxed);
+                    ordering_ok.store(false, std::memory_order_relaxed);
+                }
+                ++exp;
+            });
+            if (got == 0) {
+                if (producer_done.load(std::memory_order_acquire) && ring.empty_approx()) break;
+                cpu_relax();
+            }
+        }
+        received.store(exp, std::memory_order_relaxed);
+    });
+
+    std::thread producer([&] {
+        std::mt19937_64 rng(0x1234ABCDULL);
+        std::vector<Order> batch;
+        batch.reserve(64);
+        Order tmpl{};
+        tmpl.side = Side::BUY; tmpl.type = OrderType::LIMIT;
+        tmpl.price = 300; tmpl.quantity = 1; tmpl.remaining = 1;
+        std::uint64_t i = 0;
+        while (i < N) {
+            std::size_t bsz = 1 + static_cast<std::size_t>(rng() % 50);   // 1..50 items
+            if (i + bsz > N) bsz = static_cast<std::size_t>(N - i);
+            batch.clear();
+            for (std::size_t k = 0; k < bsz; ++k) {
+                Order o = tmpl; o.id = i; o.seq = i;                       // seq = global monotonic
+                batch.push_back(o);
+                ++i;
+            }
+            ring.publish_batch(batch);   // one release-store; busy-spins if full (zero-drop)
+        }
+        producer_done.store(true, std::memory_order_release);
+    });
+
+    producer.join();
+    consumer.join();
+
+    CHECK(ordering_ok.load());
+    CHECK(received.load() == N);
+
+    if (!ordering_ok.load()) {
+        std::printf("    BATCH-PUB ORDER VIOLATION: expected seq=%llu but got seq=%llu\n",
+                    (unsigned long long)bad_expected.load(), (unsigned long long)bad_got.load());
+    } else if (received.load() != N) {
+        std::printf("    BATCH-PUB LOSS: received %llu of %llu\n",
+                    (unsigned long long)received.load(), (unsigned long long)N);
+    } else {
+        std::printf("    OK: %llu items via publish_batch(1..50) -> consume_batch, strict order, ring=%zu\n",
                     (unsigned long long)N, RING);
     }
 }

@@ -15,8 +15,8 @@ mkdir -p build
 {
     echo "== compiler =="
     "$CXX" --version | head -1
-    echo "== building ingress_ring_tests (ThreadSanitizer) =="
-    if "$CXX" "${FLAGS[@]}" tests/ingress_ring_tests.cpp -o build/ring_tsan; then
+    echo "== building spsc_ring_tests (ThreadSanitizer) =="
+    if "$CXX" "${FLAGS[@]}" tests/spsc_ring_tests.cpp -o build/ring_tsan; then
         echo "COMPILE_OK"
         # setarch -R disables ASLR for the process: works around TSan's
         # "unexpected memory mapping" fatal on high-entropy kernels (Ubuntu 24.04 / WSL2).
