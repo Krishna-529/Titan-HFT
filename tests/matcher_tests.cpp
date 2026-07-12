@@ -22,6 +22,17 @@ static Order mk(OrderId id, Side s, PriceTick p, Qty q,
     return o;
 }
 
+// Test sink: collects every published TradeEvent; never full, so the matcher's
+// zero-drop busy-spin returns immediately. Pass-throughs keep the assertions terse.
+struct VecSink {
+    std::vector<TradeEvent> trades;
+    bool try_publish(const TradeEvent& e) noexcept { trades.push_back(e); return true; }
+    void reserve(std::size_t n) { trades.reserve(n); }
+    std::size_t size() const noexcept { return trades.size(); }
+    bool empty() const noexcept { return trades.empty(); }
+    const TradeEvent& operator[](std::size_t i) const noexcept { return trades[i]; }
+};
+
 // ------------------------------------------------------------ TradeEvent POD
 TEST_CASE(trade_event_is_pod_and_sized) {
     CHECK(sizeof(TradeEvent) == 32);
@@ -33,7 +44,7 @@ TEST_CASE(limit_full_fill_clears_maker) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     CHECK(book.add(mk(1, Side::SELL, 100, 10)));      // resting ask
     MatchResult r = m.submit(mk(2, Side::BUY, 100, 10), tr);
@@ -57,7 +68,7 @@ TEST_CASE(limit_partial_fill_leaves_maker_resting) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     book.add(mk(1, Side::SELL, 100, 10));
     MatchResult r = m.submit(mk(2, Side::BUY, 100, 4), tr);
@@ -77,7 +88,7 @@ TEST_CASE(limit_taker_residual_rests_on_book) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     book.add(mk(1, Side::SELL, 100, 5));
     MatchResult r = m.submit(mk(2, Side::BUY, 100, 8), tr);   // buys 5, 3 left over
@@ -97,7 +108,7 @@ TEST_CASE(sweep_respects_price_then_time_priority) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     // Same-level makers (time priority: id1 before id2), plus a worse-priced level.
     book.add(mk(1, Side::SELL, 100, 3, OrderType::LIMIT, 1));
@@ -125,7 +136,7 @@ TEST_CASE(market_order_sweeps_and_discards_residual) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     book.add(mk(1, Side::SELL, 100, 2));
     book.add(mk(2, Side::SELL, 101, 2));
@@ -147,7 +158,7 @@ TEST_CASE(ioc_fills_what_it_can_then_discards) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     book.add(mk(1, Side::SELL, 100, 3));
     MatchResult r = m.submit(mk(9, Side::BUY, 100, 10, OrderType::IOC), tr);
@@ -165,7 +176,7 @@ TEST_CASE(non_crossing_limit_rests_without_trading) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     book.add(mk(1, Side::SELL, 105, 5));              // ask at 105
     MatchResult r = m.submit(mk(2, Side::BUY, 100, 5), tr);   // bid at 100: no cross
@@ -184,7 +195,7 @@ TEST_CASE(sell_taker_crosses_bids_high_to_low) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     book.add(mk(1, Side::BUY, 100, 5));
     book.add(mk(2, Side::BUY, 99,  5));
@@ -206,7 +217,7 @@ TEST_CASE(market_into_empty_book_is_safe) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     MatchResult r = m.submit(mk(1, Side::BUY, 0, 5, OrderType::MARKET), tr);
     CHECK(r.filled == 0u);
@@ -216,21 +227,20 @@ TEST_CASE(market_into_empty_book_is_safe) {
     CHECK(book.active_orders() == 0u);
 }
 
-// ------------------------------------------------------------ mock sink overflow: book stays consistent
-TEST_CASE(sink_overflow_does_not_corrupt_book) {
+// ------------------------------------------------------------ zero-drop: every trade delivered
+TEST_CASE(sink_receives_every_trade) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(1);        // room for only ONE event
+    VecSink tr; tr.reserve(64);
 
     book.add(mk(1, Side::SELL, 100, 1));
     book.add(mk(2, Side::SELL, 100, 1));
-    MatchResult r = m.submit(mk(9, Side::BUY, 100, 2), tr);   // 2 trades, sink holds 1
+    MatchResult r = m.submit(mk(9, Side::BUY, 100, 2), tr);   // sweeps both -> 2 trades
 
-    CHECK(r.filled == 2u);                            // matching completes regardless
+    CHECK(r.filled == 2u);
     CHECK(r.trades == 2u);
-    CHECK(r.sink_overflow);                           // flagged
-    CHECK(tr.size() == 1u);                           // never reallocated past capacity
+    CHECK(tr.size() == 2u);                           // zero-drop: every trade published to the sink
     CHECK(book.best_ask() == nullptr);                // book fully consumed & consistent
     CHECK(book.active_orders() == 0u);
 }
@@ -240,7 +250,7 @@ TEST_CASE(sweep_drains_a_multi_node_level) {
     Arena arena(32u * 1024 * 1024);
     OrderBook book(arena, 2048);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(512);
+    VecSink tr; tr.reserve(512);
 
     const int N = 200;                                // > PIN capacity -> node chaining
     for (int i = 0; i < N; ++i)
@@ -266,7 +276,7 @@ TEST_CASE(intra_node_fifo_survives_cancel_and_refill) {
     Arena arena(16u * 1024 * 1024);
     OrderBook book(arena, 1024);
     Matcher m(book);
-    std::vector<TradeEvent> tr; tr.reserve(64);
+    VecSink tr; tr.reserve(64);
 
     // 3 resting sells at one price -> physical slots 0,1,2; FIFO 1 -> 2 -> 3.
     CHECK(book.add(mk(1, Side::SELL, 100, 1, OrderType::LIMIT, 1)));   // slot 0

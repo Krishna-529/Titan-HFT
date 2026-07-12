@@ -45,6 +45,12 @@ struct Op {
     OpKind kind;
 };
 
+// Cheap egress sink for the single-thread bench: counts trades, never full.
+struct CountingSink {
+    std::uint64_t count = 0;
+    bool try_publish(const TradeEvent&) noexcept { ++count; return true; }
+};
+
 // A passive limit: bids strictly below MID, asks strictly above -> they never
 // cross each other, so limit adds rest and build depth; market/IOC do the trading.
 inline Order make_limit(OrderId id, bool buy, std::mt19937_64& rng) noexcept {
@@ -124,8 +130,7 @@ int main() {
             }
         }
 
-        std::vector<TradeEvent> egress;
-        egress.reserve(1024);
+        CountingSink egress;
 
         std::uint64_t sink = 0;                 // anti dead-code-elimination
         std::uint64_t fills = 0, trades = 0, cxl_hits = 0;
@@ -136,7 +141,6 @@ int main() {
                 const MatchResult r = matcher.submit(op.order, egress);
                 sink += r.filled + r.trades;
                 fills += r.filled; trades += r.trades;
-                egress.clear();                 // drain mock egress -> stays bounded
             } else {
                 const bool ok = book.cancel(op.order.id);
                 sink += static_cast<std::uint64_t>(ok);

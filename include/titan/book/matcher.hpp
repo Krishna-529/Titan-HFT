@@ -37,11 +37,10 @@ namespace titan {
 
 // Outcome of matching one incoming order.
 struct MatchResult {
-    Qty           filled        = 0;      // quantity of the incoming order that traded
-    Qty           residual      = 0;      // quantity left over after crossing
-    std::uint32_t trades        = 0;      // number of fills generated
-    bool          rested        = false;  // residual added to the book (LIMIT only)
-    bool          sink_overflow = false;  // egress vector hit capacity (mock limitation)
+    Qty           filled   = 0;      // quantity of the incoming order that traded
+    Qty           residual = 0;      // quantity left over after crossing
+    std::uint32_t trades   = 0;      // number of fills generated
+    bool          rested   = false;  // residual added to the book (LIMIT only)
 };
 
 template <class BookT>
@@ -49,15 +48,17 @@ class MatcherT {
 public:
     explicit MatcherT(BookT& book) noexcept : book_(book) {}
 
-    // Cross `in` against the book. `out` is the mock egress sink (reserve capacity!).
-    // Never throws, never allocates on the OS heap, never crashes.
-    MatchResult submit(Order in, std::vector<TradeEvent>& out) noexcept {
+    // Cross `in` against the book, publishing every fill to `sink` -- any type
+    // exposing `bool try_publish(const TradeEvent&)` (the EgressRing in production, a
+    // vector-backed collector in tests). Never throws, never OS-allocates, never crashes.
+    template <class Sink>
+    MatchResult submit(Order in, Sink& sink) noexcept {
         MatchResult r{};
         const Qty original = in.remaining;
 
         if (in.remaining != 0) {
-            if (in.side == Side::BUY) cross(book_.asks_, in, /*taker_buy=*/true,  out, r);
-            else                      cross(book_.bids_, in, /*taker_buy=*/false, out, r);
+            if (in.side == Side::BUY) cross(book_.asks_, in, /*taker_buy=*/true,  sink, r);
+            else                      cross(book_.bids_, in, /*taker_buy=*/false, sink, r);
         }
 
         r.filled   = static_cast<Qty>(original - in.remaining);
@@ -73,9 +74,9 @@ public:
 private:
     // Walk the opposite book from best price outward, consuming liquidity while the
     // incoming order still crosses. `Map` is deduced as OrderBook's Bid/Ask map.
-    template <class Map>
+    template <class Map, class Sink>
     void cross(Map& opp, Order& in, bool taker_buy,
-               std::vector<TradeEvent>& out, MatchResult& r) noexcept {
+               Sink& sink, MatchResult& r) noexcept {
         while (in.remaining != 0 && !opp.empty()) {
             auto it = opp.begin();                 // best level (ordered by the map comparator)
             PriceLevel& lvl = it->second;
@@ -86,7 +87,7 @@ private:
                             : (in.price <= lvl.price);
             if (!crosses) break;                   // best price no longer marketable
 
-            sweep_level(lvl, in, taker_buy, out, r);
+            sweep_level(lvl, in, taker_buy, sink, r);
 
             if (lvl.order_count == 0) {            // level fully consumed -> reclaim + erase
                 book_.free_level_nodes(lvl);       // defensive (sweep already freed drained nodes)
@@ -97,8 +98,9 @@ private:
 
     // Fill against the front-of-queue orders at ONE price level in time priority:
     // head node first, along the intrusive chain; lowest occupied slot within a node.
+    template <class Sink>
     void sweep_level(PriceLevel& lvl, Order& in, bool taker_buy,
-                     std::vector<TradeEvent>& out, MatchResult& r) noexcept {
+                     Sink& sink, MatchResult& r) noexcept {
         while (in.remaining != 0) {
             typename BookT::NodeType* pn = front_node(lvl);  // reclaims empty leading nodes
             if (pn == nullptr) break;
@@ -122,7 +124,7 @@ private:
             maker.remaining = static_cast<Qty>(maker.remaining - fill);
             lvl.total_qty   = (lvl.total_qty >= fill) ? (lvl.total_qty - fill) : 0;
 
-            emit(out, maker, in, taker_buy, fill, r);
+            emit(sink, maker, in, taker_buy, fill, r);
 
             if (maker.remaining == 0) {            // maker fully filled -> remove from book
                 book_.erase_id(maker.id);
@@ -153,17 +155,17 @@ private:
         return nullptr;
     }
 
-    // Record a fill into the mock egress sink. Bounded push -> never reallocates.
-    void emit(std::vector<TradeEvent>& out, const Order& maker, const Order& taker,
+    // Publish a fill to the egress sink with STRICT zero-drop backpressure: if the sink
+    // (EgressRing) is full, busy-spin until the downstream consumer frees a slot. A
+    // never-full sink (e.g. a growing vector in tests) simply returns true immediately.
+    template <class Sink>
+    void emit(Sink& sink, const Order& maker, const Order& taker,
               bool taker_buy, Qty qty, MatchResult& r) noexcept {
         ++r.trades;
-        if (out.size() < out.capacity()) {
-            out.push_back(TradeEvent{
-                taker.id, maker.id, maker.price, qty,
-                taker_buy ? Side::BUY : Side::SELL, {0, 0, 0}});
-        } else {
-            r.sink_overflow = true;   // mock sink full; caller should reserve() more
-        }
+        const TradeEvent ev{
+            taker.id, maker.id, maker.price, qty,
+            taker_buy ? Side::BUY : Side::SELL, {0, 0, 0}};
+        while (!sink.try_publish(ev)) { /* zero-drop: spin until space clears */ }
     }
 
     BookT& book_;
