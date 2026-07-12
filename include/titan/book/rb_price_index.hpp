@@ -43,7 +43,7 @@ class RBPriceIndex {
         Color color = BLACK;
     };
 
-    std::vector<Node>          nodes_;
+    std::pmr::vector<Node>     nodes_;   // pooled node store (arena-backed via pmr)
     std::vector<std::uint32_t> free_;
     std::uint32_t root_  = NIL;
     std::uint32_t begin_ = NIL;   // in-order first (best per Compare)
@@ -170,9 +170,10 @@ public:
     // Constructor is call-compatible with std::pmr::map(Compare, memory_resource*)
     // so OrderBook can build either container the same way. `capacity` bounds the
     // number of simultaneously-active price levels.
-    RBPriceIndex(Compare cmp, std::pmr::memory_resource* /*unused*/,
+    RBPriceIndex(Compare cmp, std::pmr::memory_resource* resource,
                  std::size_t capacity = (std::size_t{1} << 16))
-        : before_(cmp) {
+        : nodes_(resource ? resource : std::pmr::get_default_resource()),
+          before_(cmp) {
         nodes_.resize(capacity + 1);                 // +1 for the sentinel at index 0
         nodes_[NIL].color = BLACK;
         free_.reserve(capacity);
@@ -198,6 +199,9 @@ public:
 
     iterator end()   noexcept { return iterator(this, NIL); }
     iterator begin() noexcept { return iterator(this, begin_); }
+    // const overload for read-only best_bid()/best_ask(); the returned iterator is
+    // only dereferenced for reading (const_cast is safe here).
+    iterator begin() const noexcept { return iterator(const_cast<RBPriceIndex*>(this), begin_); }
     bool     empty() const noexcept { return size_ == 0; }
     std::size_t size() const noexcept { return size_; }
 

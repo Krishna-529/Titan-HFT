@@ -19,13 +19,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <memory_resource>
 #include <vector>
 
 #include "titan/book/order.hpp"
 #include "titan/book/pin_node.hpp"
 #include "titan/book/price_level.hpp"
+#include "titan/book/rb_price_index.hpp"
 #include "titan/domain/types.hpp"
 #include "titan/memory/arena.hpp"
 
@@ -41,8 +41,8 @@ struct SlabEntry {
 };
 
 template <class NodeT,
-          class BidMapT = std::pmr::map<PriceTick, PriceLevel, std::greater<PriceTick>>,
-          class AskMapT = std::pmr::map<PriceTick, PriceLevel, std::less<PriceTick>>>
+          class BidMapT = RBPriceIndex<std::greater<PriceTick>>,
+          class AskMapT = RBPriceIndex<std::less<PriceTick>>>
 class OrderBookT {
 public:
     using NodeType = NodeT;
