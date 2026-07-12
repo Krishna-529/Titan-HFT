@@ -100,6 +100,30 @@ public:
         return true;
     }
 
+    // Batch-drain: consume EVERY currently-available order, invoking fn(const Order&)
+    // for each, then publish the consumer sequence ONCE. Amortising the release-store
+    // over the whole batch collapses the `next` cache-line ping-pong from once-per-msg
+    // to once-per-batch. The loop prefetches the next slot's payload into L1 while fn()
+    // runs on the current one, hiding the cross-core coherence transfer behind useful
+    // work. Returns the number consumed (0 if empty). SPSC: consumer thread only.
+    template <class Handler>
+    std::uint64_t consume_batch(Handler&& fn) noexcept {
+        const std::uint64_t start = cons_.next.load(std::memory_order_relaxed);   // own seq
+        const std::uint64_t avail = prod_.cursor.load(std::memory_order_acquire); // one acquire / batch
+        if (start == avail) return 0;                                             // ring empty
+        cons_.cached_cursor = avail;
+
+        std::uint64_t seq = start;
+        do {
+            __builtin_prefetch(&slots_[(seq + 1) & MASK], 0, 1);   // pull next payload into L1
+            fn(slots_[seq & MASK]);                                // process current (fn copies it)
+            ++seq;
+        } while (seq != avail);
+
+        cons_.next.store(seq, std::memory_order_release);          // publish consumed ONCE per batch
+        return seq - start;
+    }
+
     // Approximate in-flight count (metrics only; not a synchronization point).
     std::uint64_t size_approx() const noexcept {
         return prod_.cursor.load(std::memory_order_acquire)

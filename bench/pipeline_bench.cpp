@@ -102,14 +102,13 @@ double run_pipeline(const std::vector<Order>& orders) {
         ready.fetch_add(1, std::memory_order_release);
         while (!go.load(std::memory_order_acquire)) { }        // busy-wait for start
 
-        Order in{};
-        for (std::uint64_t c = 0; c < N; ) {
-            if (ring.try_consume(in)) {                        // strict busy-spin (no yield)
+        std::uint64_t c = 0;
+        while (c < N) {                                        // strict busy-spin (no yield)
+            c += ring.consume_batch([&](const Order& in) {     // batch-drain + prefetch
                 const MatchResult r = matcher.submit(in, egress);
                 s += r.filled + r.trades;
                 egress.clear();
-                ++c;
-            }
+            });
         }
         sink.store(s, std::memory_order_relaxed);
     });
