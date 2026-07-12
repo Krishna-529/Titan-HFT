@@ -98,4 +98,73 @@ TEST_CASE(spsc_ring_preserves_strict_order_under_contention) {
     }
 }
 
+// Same stress, but the consumer uses consume_batch() (snapshot cursor, drain the run,
+// prefetch, single release-store) instead of one-at-a-time try_consume. Verifies the
+// batch path preserves strict order ACROSS batch boundaries, race-free under TSan.
+TEST_CASE(spsc_batch_drain_preserves_strict_order) {
+    constexpr std::uint64_t N    = 5'000'000;
+    constexpr std::size_t   RING = 1u << 10;
+
+    IngressRing<RING> ring;
+
+    std::atomic<bool>          producer_done{false};
+    std::atomic<bool>          abort_run{false};
+    std::atomic<std::uint64_t> received{0};
+    std::atomic<bool>          ordering_ok{true};
+    std::atomic<std::uint64_t> bad_expected{0};
+    std::atomic<std::uint64_t> bad_got{0};
+
+    std::thread consumer([&] {
+        std::uint64_t exp = 0;                                        // consumer-thread-local
+        while (exp < N && ordering_ok.load(std::memory_order_relaxed)) {
+            const std::uint64_t got = ring.consume_batch([&](const Order& o) {
+                if (o.seq != exp && ordering_ok.load(std::memory_order_relaxed)) {
+                    bad_expected.store(exp,   std::memory_order_relaxed);
+                    bad_got.store(o.seq,      std::memory_order_relaxed);
+                    ordering_ok.store(false,  std::memory_order_relaxed);
+                }
+                ++exp;
+            });
+            if (got == 0) {
+                if (producer_done.load(std::memory_order_acquire) && ring.empty_approx()) break;
+                cpu_relax();
+            }
+        }
+        if (!ordering_ok.load(std::memory_order_relaxed))
+            abort_run.store(true, std::memory_order_release);
+        received.store(exp, std::memory_order_relaxed);
+    });
+
+    std::thread producer([&] {
+        Order o{};
+        o.side = Side::SELL; o.type = OrderType::LIMIT;
+        o.price = 200; o.quantity = 1; o.remaining = 1;
+        for (std::uint64_t i = 0; i < N; ++i) {
+            o.id = i; o.seq = i;
+            while (!ring.try_publish(o)) {
+                if (abort_run.load(std::memory_order_acquire)) return;
+                cpu_relax();
+            }
+        }
+        producer_done.store(true, std::memory_order_release);
+    });
+
+    producer.join();
+    consumer.join();
+
+    CHECK(ordering_ok.load());
+    CHECK(received.load() == N);
+
+    if (!ordering_ok.load()) {
+        std::printf("    BATCH ORDER VIOLATION: expected seq=%llu but got seq=%llu\n",
+                    (unsigned long long)bad_expected.load(), (unsigned long long)bad_got.load());
+    } else if (received.load() != N) {
+        std::printf("    BATCH LOSS: received %llu of %llu orders\n",
+                    (unsigned long long)received.load(), (unsigned long long)N);
+    } else {
+        std::printf("    OK: %llu orders via consume_batch, strict in-order, ring=%zu slots\n",
+                    (unsigned long long)N, RING);
+    }
+}
+
 int main() { return ut::run_all(); }

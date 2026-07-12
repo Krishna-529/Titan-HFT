@@ -30,25 +30,10 @@
 #include "titan/book/order_book.hpp"
 #include "titan/book/pin_node.hpp"
 #include "titan/book/price_level.hpp"
+#include "titan/book/trade_event.hpp"
 #include "titan/domain/types.hpp"
 
 namespace titan {
-
-// Emitted on every fill. Trivially-copyable POD so it can later drop straight
-// into a Disruptor ring slot (single memcpy, no heap, no vtable).
-struct TradeEvent {
-    OrderId      taker_id;    // 8  aggressor (incoming) order id
-    OrderId      maker_id;    // 8  resting order that was hit
-    PriceTick    price;       // 8  execution price = resting (maker) price
-    Qty          quantity;    // 4  traded quantity
-    Side         taker_side;  // 1  aggressor side (BUY => buyer lifted an ask)
-    std::uint8_t _pad[3];     // 3  explicit padding -> deterministic 32-byte layout
-};
-
-static_assert(sizeof(TradeEvent) == 32,                 "TradeEvent layout drift");
-static_assert(std::is_trivially_copyable_v<TradeEvent>, "TradeEvent must be a POD");
-static_assert(std::is_standard_layout_v<TradeEvent>,    "TradeEvent must be standard layout");
-static_assert(alignof(TradeEvent) == 8,                 "TradeEvent should be 8-byte aligned");
 
 // Outcome of matching one incoming order.
 struct MatchResult {
