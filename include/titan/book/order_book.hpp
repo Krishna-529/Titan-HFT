@@ -2,25 +2,25 @@
 //
 // titan/book/order_book.hpp
 // The limit order book: price index -> PriceLevel -> PIN_Node chain, plus an
-// O(1) id index for lazy cancellation.
+// O(1) DENSE SLAB (id -> {node, slot}) for cancellation.
 //
 //   * bids_/asks_  : std::pmr::map (allocations carve from the Arena, never the heap)
-//   * id_index_    : std::pmr::unordered_map<OrderId, Locator> for O(1) cancel
+//   * locators_    : flat std::vector<SlabEntry> indexed DIRECTLY by OrderId.
+//                    Hash-free, single cache miss (replaces std::pmr::unordered_map).
+//                    Requires a bounded/dense id space: ids >= id_capacity are
+//                    rejected (never crash). Production would recycle ids (ring/slab).
 //   * nodes_       : pre-sized PIN_Node pool (one startup allocation, never grows)
 //   * free_nodes_  : freelist (stack of node indices) -> O(1) alloc/free, bounded
 //
-// This draft intentionally contains NO matching logic yet — only insert (add a
-// resting order) and lazy cancel. Every public mutator is noexcept and wraps its
-// (potentially allocating) index work in try/catch, so arena exhaustion degrades
-// to a graceful rejection instead of a crash. Nothing here can segfault: all node
-// and slot accesses are bounds-checked.
+// Every public mutator is noexcept and cannot crash: all node / slot / id accesses
+// are bounds-checked; the (allocating) price-map work is wrapped so arena exhaustion
+// degrades to a graceful rejection instead of a throw escaping a noexcept function.
 //
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory_resource>
-#include <unordered_map>
 #include <vector>
 
 #include "titan/book/order.hpp"
@@ -31,67 +31,77 @@
 
 namespace titan {
 
-// Where a live order physically sits, for O(1) cancellation.
-struct Locator {
+// Dense-slab entry: where a live order physically sits. node == INVALID_INDEX
+// means the id is not live (free slab slot). Kept to 8 bytes -> one cache line
+// holds 8 entries; price/side are read back from the Order on cancel (we touch
+// the node anyway), so they need not be duplicated here.
+struct SlabEntry {
     std::uint32_t node;   // PIN_Node pool index
     std::uint32_t slot;   // slot within the node [0, CAPACITY)
-    PriceTick     price;  // owning price level
-    Side          side;   // which book half
 };
 
-class OrderBook {
+template <class NodeT>
+class OrderBookT {
 public:
-    // `arena` backs the pmr index containers; `max_nodes` bounds the node pool
-    // (=> up to max_nodes * PIN_Node::CAPACITY resting orders).
-    OrderBook(Arena& arena, std::uint32_t max_nodes)
+    using NodeType = NodeT;
+
+    // `arena` backs the pmr price maps; `max_nodes` bounds the node pool
+    // (=> up to max_nodes * NodeT::CAPACITY resting orders). `id_capacity`
+    // sizes the id->locator slab; 0 => derive from the pool (max_nodes*CAPACITY).
+    OrderBookT(Arena& arena, std::uint32_t max_nodes, std::uint64_t id_capacity = 0)
         : arena_(arena),
           nodes_(max_nodes),
+          locators_(id_capacity ? id_capacity
+                                 : static_cast<std::uint64_t>(max_nodes) * NodeT::CAPACITY,
+                    SlabEntry{INVALID_INDEX, 0}),
           bids_(std::greater<PriceTick>(), arena.pmr()),
-          asks_(std::less<PriceTick>(),    arena.pmr()),
-          id_index_(arena.pmr()) {
+          asks_(std::less<PriceTick>(),    arena.pmr()) {
         free_nodes_.reserve(max_nodes);
         for (std::uint32_t i = max_nodes; i-- > 0; ) free_nodes_.push_back(i);
-        // Pre-size id-index buckets so steady-state inserts don't rehash.
-        id_index_.reserve(static_cast<std::size_t>(max_nodes) * PIN_Node::CAPACITY / 2);
     }
 
-    OrderBook(const OrderBook&)            = delete;
-    OrderBook& operator=(const OrderBook&) = delete;
+    OrderBookT(const OrderBookT&)            = delete;
+    OrderBookT& operator=(const OrderBookT&) = delete;
 
-    // Add a resting limit order. Returns false if rejected (duplicate id or pool
-    // exhausted). noexcept: never throws, never corrupts, never crashes.
+    // The matching engine (titan/book/matcher.hpp) consumes liquidity by reaching
+    // into the node pool / slab; grant it access rather than widen the public API.
+    template <class> friend class MatcherT;
+
+    // Add a resting limit order. Returns false if rejected (duplicate id, id out of
+    // slab range, or pool/arena exhausted). noexcept: never throws, never crashes.
     bool add(const Order& o) noexcept {
+        if (o.id >= locators_.size()) return false;              // id out of slab range
+        if (locators_[o.id].node != INVALID_INDEX) return false; // duplicate (already live)
         try {
-            if (id_index_.find(o.id) != id_index_.end()) return false;  // dedup
             return (o.side == Side::BUY) ? add_impl(bids_, o)
                                          : add_impl(asks_, o);
         } catch (...) {
-            return false;  // arena exhausted / allocation failure -> reject, don't crash
+            return false;   // arena exhausted -> reject, don't crash
         }
     }
 
     // Lazily cancel by id. Returns true if a live order was removed.
     bool cancel(OrderId id) noexcept {
+        if (id >= locators_.size()) return false;
+        const SlabEntry loc = locators_[id];
+        if (loc.node == INVALID_INDEX) return false;                     // not live
+        if (loc.node >= nodes_.size()) { clear_slot(id); return false; } // bounds (defensive)
+
+        Order* ord = nodes_[loc.node].at(loc.slot);
+        if (ord == nullptr) { clear_slot(id); return false; }            // stale
+
+        const Qty       rem   = ord->remaining;
+        const PriceTick price = ord->price;   // read back from the order (no dup in slab)
+        const Side      side  = ord->side;
+
+        nodes_[loc.node].remove(loc.slot);    // clear occupancy bit + FIFO unlink (O(1))
+        clear_slot(id);
+
         try {
-            auto it = id_index_.find(id);
-            if (it == id_index_.end()) return false;
-
-            const Locator loc = it->second;
-            if (loc.node >= nodes_.size()) { id_index_.erase(it); return false; }  // bounds
-
-            Order* ord = nodes_[loc.node].at(loc.slot);
-            if (ord == nullptr) { id_index_.erase(it); return false; }             // stale
-
-            const Qty rem = ord->remaining;
-            nodes_[loc.node].remove(loc.slot);  // clear the occupancy bit (lazy)
-            id_index_.erase(it);
-
-            if (loc.side == Side::BUY) update_after_cancel(bids_, loc.price, rem);
-            else                       update_after_cancel(asks_, loc.price, rem);
-            return true;
-        } catch (...) {
-            return false;
-        }
+            if (side == Side::BUY) update_after_cancel(bids_, price, rem);
+            else                   update_after_cancel(asks_, price, rem);
+        } catch (...) { /* map find/erase here don't allocate; defensive only */ }
+        return true;
     }
 
     // --- Top-of-book / introspection (read-only, noexcept) ---
@@ -103,7 +113,7 @@ public:
     }
     std::size_t   bid_levels()    const noexcept { return bids_.size(); }
     std::size_t   ask_levels()    const noexcept { return asks_.size(); }
-    std::size_t   active_orders() const noexcept { return id_index_.size(); }
+    std::size_t   active_orders() const noexcept { return live_count_; }
     std::uint32_t free_node_count() const noexcept {
         return static_cast<std::uint32_t>(free_nodes_.size());
     }
@@ -111,6 +121,20 @@ public:
 private:
     using BidMap = std::pmr::map<PriceTick, PriceLevel, std::greater<PriceTick>>;
     using AskMap = std::pmr::map<PriceTick, PriceLevel, std::less<PriceTick>>;
+
+    // ---- slab helpers ----
+    // Free a slab slot known to be live (caller checked id range + liveness).
+    void clear_slot(OrderId id) noexcept {
+        locators_[id].node = INVALID_INDEX;
+        --live_count_;
+    }
+    // Matcher calls this on fill to drop a fully-filled maker from the slab.
+    void erase_id(OrderId id) noexcept {
+        if (id < locators_.size() && locators_[id].node != INVALID_INDEX) {
+            locators_[id].node = INVALID_INDEX;
+            --live_count_;
+        }
+    }
 
     // ---- node pool (freelist) ----
     std::uint32_t alloc_node() noexcept {
@@ -135,7 +159,8 @@ private:
         if (slot == INVALID_INDEX) return false;         // defensive (space was ensured)
         lvl->total_qty   += o.remaining;
         lvl->order_count += 1;
-        id_index_.emplace(o.id, Locator{node_idx, slot, o.price, o.side});
+        locators_[o.id] = SlabEntry{node_idx, slot};     // O(1) slab write
+        ++live_count_;
         return true;
     }
 
@@ -196,12 +221,16 @@ private:
         lvl.head = lvl.tail = INVALID_INDEX;
     }
 
-    Arena&                     arena_;       // kept for lifetime clarity / future use
-    std::vector<PIN_Node>      nodes_;       // node pool (one startup allocation)
+    Arena&                     arena_;       // backs the pmr price maps
+    std::vector<NodeT>         nodes_;       // node pool (one startup allocation)
+    std::vector<SlabEntry>     locators_;    // id -> {node, slot}; flat, O(1), hash-free
     std::vector<std::uint32_t> free_nodes_;  // freelist stack of node indices
     BidMap                     bids_;        // highest price first
     AskMap                     asks_;        // lowest price first
-    std::pmr::unordered_map<OrderId, Locator> id_index_;
+    std::size_t                live_count_ = 0;  // active_orders() without scanning the slab
 };
+
+// Default book type used everywhere outside the A/B layout experiments.
+using OrderBook = OrderBookT<PIN_Node>;
 
 } // namespace titan
