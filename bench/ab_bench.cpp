@@ -17,10 +17,12 @@
 //
 #include "titan/book/matcher.hpp"
 #include "titan/book/order_book.hpp"
+#include "titan/book/rb_price_index.hpp"
 #include "titan/memory/arena.hpp"
 #include "workload.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -70,9 +72,12 @@ struct EngineT {
     }
 };
 
-// A = baseline (slots-first PIN_Node);  B = hot/cold (metadata-first PIN_Node_HC).
+// A = baseline (std::pmr::map price index);  B = intrusive Red-Black price index.
 using EngineBase = EngineT<OrderBook, Matcher>;
-using EngineHC   = EngineT<OrderBookT<PIN_Node_HC>, MatcherT<OrderBookT<PIN_Node_HC>>>;
+using RBBook     = OrderBookT<PIN_Node,
+                              RBPriceIndex<std::greater<PriceTick>>,
+                              RBPriceIndex<std::less<PriceTick>>>;
+using EngineRB   = EngineT<RBBook, MatcherT<RBBook>>;
 
 // Time applying ops[lo,hi) to engine e; return elapsed ns for that slice.
 template <class Eng>
@@ -143,14 +148,15 @@ int main() {
     std::printf("workload: %zu ops (adds=%zu cancels=%zu mkt/ioc=%zu)  seed=%zu\n\n",
                 ops.size(), adds, cancels, mktioc, SEED_ORDERS);
 
-    // ---- A = baseline node layout,  B = hot/cold (metadata-first) node layout ----
+    // ---- A = std::pmr::map price index,  B = intrusive Red-Black price index ----
     EngineBase a;
-    EngineHC   b;
+    EngineRB   b;
     a.seed();
     b.seed();
-    ab_compare(a, b, ops, "baseline", "hotcold");
+    ab_compare(a, b, ops, "pmr-map", "rb-tree");
 
-    std::printf("\n(Identical-code zero-point is 0.986. B (hot/cold) is a real win only if its"
-                " RATIO median lands clearly below ~0.97.)\n");
+    std::printf("\n(RATIO < 1.0 => the intrusive RB index (O(1) splice/graft, 1 search) beats"
+                " std::pmr::map. Identical-code zero-point is ~0.99; state MATCH also cross-checks"
+                " the tree orders levels identically.)\n");
     return 0;
 }

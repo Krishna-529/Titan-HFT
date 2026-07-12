@@ -40,7 +40,9 @@ struct SlabEntry {
     std::uint32_t slot;   // slot within the node [0, CAPACITY)
 };
 
-template <class NodeT>
+template <class NodeT,
+          class BidMapT = std::pmr::map<PriceTick, PriceLevel, std::greater<PriceTick>>,
+          class AskMapT = std::pmr::map<PriceTick, PriceLevel, std::less<PriceTick>>>
 class OrderBookT {
 public:
     using NodeType = NodeT;
@@ -119,8 +121,8 @@ public:
     }
 
 private:
-    using BidMap = std::pmr::map<PriceTick, PriceLevel, std::greater<PriceTick>>;
-    using AskMap = std::pmr::map<PriceTick, PriceLevel, std::less<PriceTick>>;
+    using BidMap = BidMapT;
+    using AskMap = AskMapT;
 
     // ---- slab helpers ----
     // Free a slab slot known to be live (caller checked id range + liveness).
@@ -166,18 +168,17 @@ private:
 
     template <class Map>
     PriceLevel* find_or_create_level(Map& book, PriceTick price) {
-        auto it = book.find(price);
-        if (it != book.end()) return &it->second;
-
-        const std::uint32_t n = alloc_node();
-        if (n == INVALID_INDEX) return nullptr;
-        PriceLevel lvl;
-        lvl.price = price;
-        lvl.head  = n;
-        lvl.tail  = n;
-        auto [ins, ok] = book.try_emplace(price, lvl);
-        if (!ok) { free_node(n); }   // key raced in (can't happen single-threaded)
-        return &ins->second;
+        // Single-pass find-or-create: one search, then O(1) splice on a new key.
+        auto [it, inserted] = book.try_emplace(price);
+        PriceLevel& lvl = it->second;
+        if (inserted) {
+            const std::uint32_t n = alloc_node();
+            if (n == INVALID_INDEX) { book.erase(it); return nullptr; }  // rollback new level
+            lvl.price = price;
+            lvl.head  = n;
+            lvl.tail  = n;
+        }
+        return &lvl;
     }
 
     std::uint32_t ensure_tail_with_space(PriceLevel& lvl) noexcept {
