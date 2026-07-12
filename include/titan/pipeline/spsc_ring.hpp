@@ -72,6 +72,37 @@ public:
         return true;
     }
 
+    // Publish a whole run of `n` items with a SINGLE release-store per wave -- collapses
+    // the cursor cache-line ping-pong from once-per-item to once-per-batch. Zero-drop:
+    // busy-spins when the ring is full. Handles n > Size by chunking (rare), so it can
+    // never deadlock on an oversized batch. SPSC: producer thread only.
+    void publish_batch(const T* items, std::size_t n) noexcept {
+        std::size_t done = 0;
+        while (done < n) {
+            const std::uint64_t seq = prod_.cursor.load(std::memory_order_relaxed);
+            std::uint64_t inflight  = seq - prod_.cached_consumer;
+            while (inflight >= Size) {                              // full: refresh + busy-spin
+                prod_.cached_consumer = cons_.next.load(std::memory_order_acquire);
+                inflight = seq - prod_.cached_consumer;
+            }
+            const std::size_t freeslots = static_cast<std::size_t>(Size - inflight);
+            const std::size_t remain    = n - done;
+            const std::size_t take      = (remain < freeslots) ? remain : freeslots;
+
+            const std::size_t base  = static_cast<std::size_t>(seq & MASK);
+            const std::size_t first = (base + take <= Size) ? take : (Size - base);  // until wrap
+            for (std::size_t i = 0; i < first; ++i)  slots_[base + i]    = items[done + i];
+            for (std::size_t i = first; i < take; ++i) slots_[i - first] = items[done + i];
+
+            prod_.cursor.store(seq + take, std::memory_order_release);  // publish this wave ONCE
+            done += take;
+        }
+    }
+
+    void publish_batch(const std::vector<T>& items) noexcept {
+        publish_batch(items.data(), items.size());
+    }
+
     // ---------------------------- CONSUMER (single thread) ----------------------------
     // Consume one item into `out`. Returns false if empty. Wait-free, noexcept.
     bool try_consume(T& out) noexcept {

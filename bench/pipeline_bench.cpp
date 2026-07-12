@@ -35,7 +35,8 @@ namespace {
 
 constexpr std::uint64_t N           = 5'000'000;
 constexpr std::size_t   RING_IN     = 1u << 16;             // ingress slots
-constexpr std::size_t   RING_OUT    = 1u << 16;             // egress slots
+constexpr std::size_t   RING_OUT    = 1u << 18;             // egress slots (fits a full batch's trades)
+constexpr std::size_t   LOCAL_CAP   = 1u << 20;             // matcher-local trade buffer reserve
 constexpr std::uint32_t MAX_NODES   = 1u << 16;
 constexpr std::uint64_t ID_CAP      = N + 64;
 constexpr std::size_t   ARENA_BYTES = 32ull * 1024 * 1024;
@@ -57,6 +58,13 @@ inline std::uint64_t hash_trade(const TradeEvent& t) noexcept {
 struct ChecksumSink {
     std::uint64_t chk = 0;
     bool try_publish(const TradeEvent& t) noexcept { chk += hash_trade(t); return true; }
+};
+
+// Matcher-thread-local sink: buffers trades so the matcher can batch-publish them to
+// the egress ring after each ingress batch (one release-store, not one per trade).
+struct BufferSink {
+    std::vector<TradeEvent>& buf;
+    bool try_publish(const TradeEvent& t) noexcept { buf.push_back(t); return true; }
 };
 
 std::vector<Order> generate_orders() {
@@ -146,11 +154,20 @@ double run_pipeline3(const std::vector<Order>& orders) {
         Arena arena(ARENA_BYTES);
         OrderBook book(arena, MAX_NODES, ID_CAP);
         Matcher matcher(book);
+        std::vector<TradeEvent> local_trades;
+        local_trades.reserve(LOCAL_CAP);              // pre-reserved -> no realloc on the hot path
+        BufferSink sink{local_trades};
         ready.fetch_add(1, std::memory_order_release);
         while (!go.load(std::memory_order_acquire)) { }
         std::uint64_t c = 0;
         while (c < N) {
-            c += ingress.consume_batch([&](const Order& in) { matcher.submit(in, egress); });
+            // Match a whole ingress batch into the local buffer, then flush it to egress
+            // with a SINGLE release-store (zero-drop busy-spin inside publish_batch).
+            c += ingress.consume_batch([&](const Order& in) { matcher.submit(in, sink); });
+            if (!local_trades.empty()) {
+                egress.publish_batch(local_trades);
+                local_trades.clear();
+            }
         }
         matcher_done.store(true, std::memory_order_release);
     });

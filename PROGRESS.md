@@ -15,10 +15,10 @@ components land.
 | Gateway | ❌ | — | — | — |
 | **Ingress Queue (LMAX Disruptor)** | 🟡 | v1.2.0 (+batch) | 2026-07-12 | Generic SPSC ring; **batch-drain + prefetch**; **TSan-proven** (single + batch). Wired to matcher in a bench; **SPSC**, not yet MPSC |
 | **Matching Engine (using PIN)** | ✅ | v1.1.2–v1.1.4 | 2026-07-12 | PIN book, dense-slab O(1) id index, intrusive RB-tree price index, LIMIT/MARKET/IOC + partial fills. 26 tests / 67k checks (ASan/UBSan) |
-| Sequencer | 🟡 | — | 2026-07-12 | Mock driver thread (stamps monotonic seq) in the pipeline bench |
+| Sequencer | 🟡 | v1.2.4 | 2026-07-13 | Mock driver thread (stamps monotonic seq) in the 3-thread pipeline bench |
 | Journaler | ❌ | — | — | No WAL |
-| **Egress Queue (LMAX Disruptor)** | 🟡 | (pending) | 2026-07-12 | Ring **foundation built** (`SpscRing<TradeEvent>`, single + batch). **Not yet wired** — matcher still uses a mock `std::vector` |
-| Publish Data / Trade Reporter | ❌ | — | — | — |
+| **Egress Queue (LMAX Disruptor)** | 🟡 | v1.2.4 (+batch) | 2026-07-13 | **Wired**: matcher **batch-publishes** trades (thread-local buffer → `publish_batch`, one release-store/batch, zero-drop). SPSC |
+| Publish Data / Trade Reporter | 🟡 | v1.2.4 | 2026-07-13 | Mock: a Publisher thread `consume_batch`-drains egress into a checksum. Real fan-out TBD |
 | UDP / TCP feedback → UI | ❌ | — | — | — |
 | Power-failure recovery | ❌ | — | — | Needs the journaler |
 | Server `main()` executable | ❌ | — | — | Runs via tests + benches only |
@@ -28,13 +28,16 @@ components land.
 | Path | ns/msg | throughput |
 |---|---|---|
 | Matcher alone — deep power-law book | ~180 | ~5.6 M/s |
-| Matcher alone — hot small book | ~51–76 | ~13–19 M/s |
-| **Sequencer → ring → Matcher (2 threads)** | **~47** | **~21 M msgs/s** |
+| Matcher alone — hot small book | ~47–77 | ~13–21 M/s |
+| **2-thread** (Sequencer → Ingress → Matcher) | ~43–67 | **~15–23 M/s** |
+| **3-thread** (+ Egress → Publisher, batch-publish) | ~72 | **~14–22 M/s** |
 
-The two-thread pipeline runs **faster than inline matching** (ring overhead **−9%**):
-software prefetch hides the cross-core coherence transfer, batch-drain amortises the
-consumer's release-store, and the producer core offloads ingestion. Verified via an
-in-process A/B (matcher-alone vs pipeline, back-to-back) and an identical checksum.
+Absolute ns drift with WSL2 thermal state; the reliable metric is the **within-run**
+ratio (+ identical trade checksums for correctness). Ring overheads, thermal-invariant:
+- Ingress **batch-drain + prefetch** → 2-thread overhead **+107% → −9%** (faster than inline):
+  prefetch hides the coherence transfer, and the producer core offloads ingestion.
+- Egress **batch-publish** (matcher buffers a batch, one `publish_batch`/`cursor.store`) →
+  3rd-core overhead **+60% → +7%**.
 
 ## Architectural milestones achieved
 
@@ -61,12 +64,16 @@ in-process A/B (matcher-alone vs pipeline, back-to-back) and an identical checks
 | v1.1.3 | 2026-07-12 | Intrusive RB-tree price index + GBM power-law workload |
 | v1.1.4 | 2026-07-12 | RB index promoted to default; A/B scaffolding stripped |
 | v1.2.0 | 2026-07-12 | Ingress SPSC ring + ThreadSanitizer gate |
-| *(pending)* | 2026-07-12 | Batch-drain + prefetch (~21M/s); generic `SpscRing<T>`; egress ring foundation |
+| v1.2.2 | 2026-07-12 | Batch-drain + prefetch (ingress overhead +107% → −9%) |
+| v1.2.3 | 2026-07-12 | Generic `SpscRing<T>`; egress ring foundation; batch TSan test |
+| v1.2.4 | 2026-07-13 | 3-thread pipeline: egress wiring, zero-drop backpressure |
+| *(pending)* | 2026-07-13 | Egress `publish_batch`: 3rd-core overhead +60% → +7% |
 
 ## Planned build order
-1. Wire the **egress ring** into the matcher (drop the mock vector)
-2. Server `main()`: sequencer + matcher + egress threads
-3. **Journaler** (WAL) → unlocks power-failure recovery
-4. Gateway + networking (TCP ingress, UDP publish)
-5. **MPSC** ingress (multiple gateways)
-6. UI / market-data feed
+1. ~~Wire the egress ring into the matcher~~ ✅ v1.2.4 + `publish_batch`
+2. **TSan-gate `publish_batch`** (new concurrent write path)
+3. Server `main()`: sequencer + matcher + egress threads (real, not a bench)
+4. **Journaler** (WAL) → power-failure recovery
+5. Gateway + networking (TCP ingress, UDP publish)
+6. **MPSC** ingress (multiple gateways)
+7. UI / market-data feed
