@@ -23,20 +23,27 @@ struct alignas(64) PIN_Node {
     static constexpr std::uint32_t CAPACITY = 64;    // must match the 64-bit mask
     static constexpr std::uint8_t  NIL_SLOT = 0xFF;  // "no slot" sentinel (>= CAPACITY)
 
-    std::array<Order, CAPACITY> slots;  // contiguous order storage
-    std::uint64_t occupancy_mask;       // bit i set  => slots[i] is occupied
-
-    // Intra-node FIFO chain: threads the OCCUPIED slots in strict arrival order so
-    // time priority survives a cancel that frees a low slot which a later insert
-    // then refills. Physical slot index (picked by the occupancy mask) is thus
-    // decoupled from time order. Doubly linked => O(1) unlink on cancel/fill.
-    std::array<std::uint8_t, CAPACITY> next_in_time;  // older slot -> newer slot
-    std::array<std::uint8_t, CAPACITY> prev_in_time;  // newer slot -> older slot
-    std::uint8_t  head_slot;             // oldest occupied slot (front) or NIL_SLOT
-    std::uint8_t  tail_slot;             // newest occupied slot (back)  or NIL_SLOT
-
+    // ============ METADATA HEADER (control block, cache-line front) ============
+    // Everything the crossing/cancel hot paths touch to LOCATE (occupancy_mask + head/tail)
+    // and UNLINK (FIFO links) an order, grouped at offset 0 so occupancy_mask + head_slot
+    // share the node's FIRST cache line. (With the old slots-first layout they sat ~2 lines
+    // apart -- front_node's empty-check and sweep_level's head_slot read hit two lines; now
+    // one.) The explicit alignas(64) pins this header to a clean hardware cache-line boundary.
+    alignas(64) std::uint64_t occupancy_mask;  // bit i set => slots[i] is occupied
+    std::uint8_t  head_slot;             // oldest occupied slot (FIFO front) or NIL_SLOT
+    std::uint8_t  tail_slot;             // newest occupied slot (FIFO back)  or NIL_SLOT
     std::uint32_t next;                  // next PIN_Node index in the level chain
     std::uint32_t prev;                  // prev PIN_Node index in the level chain
+
+    // Intra-node FIFO chain: threads the OCCUPIED slots in strict arrival order so time
+    // priority survives a cancel that frees a low slot which a later insert then refills.
+    // Physical slot index (from the occupancy mask) is decoupled from time order; doubly
+    // linked => O(1) unlink on cancel/fill.
+    std::array<std::uint8_t, CAPACITY> next_in_time;  // older slot -> newer slot
+    std::array<std::uint8_t, CAPACITY> prev_in_time;  // newer slot -> older slot
+
+    // ============ PAYLOAD: order storage, on its own cache line after the header ============
+    alignas(64) std::array<Order, CAPACITY> slots;    // contiguous order storage
 
     // Put a pooled node into a known-empty, unlinked state before use. The link
     // arrays need not be cleared: they are only read for occupied slots, whose
