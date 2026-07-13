@@ -1,11 +1,17 @@
 #pragma once
 //
 // titan/pipeline/sequencer.hpp
-// The Sequencer (pipeline stage T1). It is the single source of truth for arrival
-// order: it stamps a monotonic `seq` on every inbound order, WRITE-AHEAD journals it
-// to the WAL, then publishes it to the ingress ring. Journal-before-publish is the WAL
-// invariant -- an order is recorded in append order before it can affect the book, so
+// The Sequencer (pipeline stage T2, between the gateways and the matcher). It is the single
+// source of truth for arrival order: it stamps a monotonic `seq` on every order, WRITE-AHEAD
+// journals it to the WAL, then publishes it to the ingress ring. Journal-before-publish is
+// the WAL invariant -- an order is recorded in append order before it can affect the book, so
 // the log is a faithful, replayable command history.
+//
+// Two ways to drive it:
+//   * publish(Order)                 -- one order (used by recovery/tests/benches).
+//   * run(inbound_mpsc, stop_flag)   -- the active server loop: drain a Multi-Producer inbound
+//                                       MpscRing (fed by one or more TcpGateways), publish()
+//                                       each, and exit cleanly once upstream stops + drains.
 //
 // journaler.hpp is included FIRST so its _DEFAULT_SOURCE define exposes the POSIX
 // mmap/msync calls under -std=c++20 before <sys/mman.h> is pulled in transitively.
@@ -26,6 +32,7 @@
 //
 #include "titan/io/journaler.hpp"        // must be first (defines _DEFAULT_SOURCE)
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -60,6 +67,19 @@ public:
             if (sync_every_ && (++flush_no_ % sync_every_ == 0)) journal_.flush_sync();  // checkpoint
             else                                                 journal_.flush_async(); // writeback nudge
         }
+    }
+
+    // Active drain loop (the Sequencer thread, T2). Consumes orders from the inbound MPSC
+    // ring (fed by one or more gateways), stamping + journaling + publishing each to the
+    // outbound ingress ring via publish() -- so the durability cadence is applied uniformly.
+    // Exits once `upstream_stopped` is set AND the inbound ring is fully drained (the shutdown
+    // cascade: Gateway stops -> MPSC drains -> Sequencer stops), taking a final MS_SYNC on exit.
+    template <class InboundMpsc>
+    void run(InboundMpsc& inbound, std::atomic<bool>& upstream_stopped) noexcept {
+        while (!upstream_stopped.load(std::memory_order_acquire) || !inbound.empty_approx()) {
+            inbound.consume_batch([&](const Order& o) { publish(o); });   // stamp/journal/push each
+        }
+        flush();   // final durability checkpoint before the WAL is relied upon for recovery
     }
 
     // Force a durability checkpoint (e.g. on graceful drain, before relying on the WAL).

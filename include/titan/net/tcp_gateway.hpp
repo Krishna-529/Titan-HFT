@@ -39,9 +39,12 @@
 // throw on setup failure (socket/bind/listen/epoll_ctl) and to allocate one map entry
 // per LIVE TCP CONNECTION (not per order -- connections are rare/persistent in HFT).
 //
-// SequencerT only needs `void publish(Order) noexcept`, so this header does not depend
-// on titan/pipeline/sequencer.hpp -- any conforming type (real Sequencer or a test
-// mock) works, mirroring the Matcher's sink-templating pattern elsewhere in this repo.
+// The gateway pushes each parsed Order onto an inbound ring via `bool try_publish(const
+// Order&)`, with zero-drop busy-spin backpressure. In the server this ring is the shared
+// MULTI-PRODUCER MpscRing (so several gateways can feed one Sequencer); the Sequencer then
+// stamps seq + journals + forwards to the matcher. InboundRing is templated -- MpscRing in
+// production, any conforming type in tests -- mirroring the sink-templating pattern used
+// elsewhere in this repo. The gateway is now purely I/O: it does NOT stamp seq or journal.
 //
 #include <arpa/inet.h>
 #include <array>
@@ -62,11 +65,11 @@
 
 namespace titan::net {
 
-template <class SequencerT>
+template <class InboundRing>
 class TcpGateway {
 public:
     // port == 0 -> ephemeral (OS-assigned); read the real bound port back via port().
-    TcpGateway(std::uint16_t port, SequencerT& seq) : seq_(seq) {
+    TcpGateway(std::uint16_t port, InboundRing& inbound) : inbound_(inbound) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (listen_fd_ < 0) throw std::runtime_error("tcp_gateway: socket() failed");
 
@@ -218,9 +221,9 @@ private:
         }
     }
 
-    // Parse every complete Order out of one freshly-recv'd byte chunk, publishing each to the
-    // Sequencer (stamp seq -> write-ahead journal -> ingress). Finishes a carried fragment
-    // first, then walks whole Orders, then stashes any trailing partial Order in Conn::pending.
+    // Parse every complete Order out of one freshly-recv'd byte chunk, pushing each onto the
+    // inbound ring (the Sequencer downstream stamps seq + journals). Finishes a carried
+    // fragment first, then walks whole Orders, then stashes any trailing partial Order.
     void parse_chunk(Conn& c, const std::uint8_t* data, std::size_t len) noexcept {
         std::size_t off = 0;
 
@@ -232,7 +235,7 @@ private:
             c.filled += take;
             off      += take;
             if (c.filled < sizeof(Order)) return;      // still incomplete -> await more bytes
-            seq_.publish(c.pending);
+            push(c.pending);
             c.filled = 0;
         }
 
@@ -240,7 +243,7 @@ private:
         while (len - off >= sizeof(Order)) {
             Order o;
             std::memcpy(&o, data + off, sizeof(Order));   // copy out of the (unaligned) byte buffer
-            seq_.publish(o);
+            push(o);
             off += sizeof(Order);
         }
 
@@ -252,7 +255,13 @@ private:
         }
     }
 
-    SequencerT&                    seq_;
+    // Zero-drop push onto the inbound (MPSC) ring: busy-spin if it is momentarily full so no
+    // order is ever dropped. Full is transient -- the Sequencer thread drains continuously.
+    void push(const Order& o) noexcept {
+        while (!inbound_.try_publish(o)) { /* backpressure: spin until the Sequencer frees a slot */ }
+    }
+
+    InboundRing&                   inbound_;
     int                            listen_fd_  = -1;
     int                            epoll_fd_   = -1;
     int                            stop_fd_    = -1;

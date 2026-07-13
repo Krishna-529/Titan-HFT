@@ -1,20 +1,22 @@
 //
-// src/main.cpp  --  titan-server: the production entry point.
+// src/main.cpp  --  titan-server: the production entry point (final 4-thread topology).
 //
-// Wires the verified 3-thread "Flash One" topology into a running process:
+//   T1 (main)      TcpGateway   --try_publish-->        MpscRing        (multi-producer inbound)
+//   T2 (sequencer) MpscRing     --run(): stamp seq -> WAL -> ingress --> IngressRing (SPSC)
+//   T3 (matcher)   IngressRing  --consume_batch--> Matcher --publish_batch--> EgressRing
+//   T4 (publisher) EgressRing   --consume_batch--> counter/checksum (+ periodic stdout)
 //
-//   T1 (main)      TcpGateway  --Sequencer.publish()-->  IngressRing
-//                    (epoll TCP ingress; stamps seq -> write-ahead journal -> ring)
-//   T2 (matcher)   IngressRing --consume_batch--> Matcher --publish_batch--> EgressRing
-//   T3 (publisher) EgressRing  --consume_batch--> counter/checksum (+ periodic stdout)
+// The MpscRing decouples the network I/O thread(s) from the Sequencer, so multiple gateways
+// can later feed one Sequencer without contending on the SPSC ingress ring. All stages
+// busy-spin (no yield) for lowest latency -- the discipline the pipeline benchmark validated;
+// intended for dedicated/pinned cores.
 //
-// All three stages busy-spin (no yield) for lowest latency -- the same discipline the
-// pipeline benchmark validated. Intended for dedicated/pinned cores; it will hold ~100%
-// on the matcher/publisher cores even while idle (an HFT trade-off, not a bug).
-//
-// Graceful shutdown: SIGINT/SIGTERM wake the gateway (eventfd), which returns from run();
-// main then drains the pipeline (matcher finishes the ring, publisher finishes egress)
-// and joins cleanly. The WAL is msync'd on the Journaler's destructor.
+// Graceful shutdown CASCADES in pipeline order, each stage draining its input before exiting:
+//   SIGINT/SIGTERM -> gateway.stop() (eventfd) -> gw.run() returns
+//     -> gateway_stopped -> Sequencer drains MpscRing -> sequencer_done
+//       -> Matcher drains IngressRing -> matcher_done
+//         -> Publisher drains EgressRing -> exit.
+// No order is dropped and no ring is read after its producer is gone.
 //
 // tcp_gateway.hpp is included FIRST so its _GNU_SOURCE define lands before any libc header.
 //
@@ -27,6 +29,7 @@
 #include "titan/memory/arena.hpp"
 #include "titan/pipeline/egress_ring.hpp"
 #include "titan/pipeline/ingress_ring.hpp"
+#include "titan/pipeline/mpsc_ring.hpp"
 #include "titan/pipeline/sequencer.hpp"
 
 #include <atomic>
@@ -46,19 +49,21 @@ using namespace titan::pipeline;
 namespace {
 
 // ---- capacities (single-symbol venue, demo-sized; tune per deployment) ----
-constexpr std::size_t   RING_IN      = 1u << 20;          // 1,048,576 ingress slots (~40 MB)
-constexpr std::size_t   RING_OUT     = 1u << 20;          // 1,048,576 egress slots  (~32 MB)
-constexpr std::uint32_t MAX_NODES    = 1u << 16;          // PIN node pool
-constexpr std::uint64_t ID_CAP       = 1u << 22;          // ~4.2M distinct order ids (dense slab)
+constexpr std::size_t   RING_MPSC    = 1u << 20;         // inbound MPSC ring (gateways -> sequencer)
+constexpr std::size_t   RING_IN      = 1u << 20;         // ingress SPSC (sequencer -> matcher)
+constexpr std::size_t   RING_OUT     = 1u << 20;         // egress  SPSC (matcher  -> publisher)
+constexpr std::uint32_t MAX_NODES    = 1u << 16;         // PIN node pool
+constexpr std::uint64_t ID_CAP       = 1u << 22;         // ~4.2M distinct order ids (dense slab)
 constexpr std::size_t   ARENA_BYTES  = 64ull * 1024 * 1024;
-constexpr std::uint64_t WAL_CAP      = 1u << 22;          // ~4.2M orders (~160 MB). HARD bound:
-                                                          // exceeding it aborts an append (Sequencer
-                                                          // is noexcept) -> size for the session.
+constexpr std::uint64_t WAL_CAP      = 1u << 22;         // ~4.2M orders (~160 MB). HARD bound:
+                                                         // exceeding it aborts an append (Sequencer
+                                                         // is noexcept) -> size for the session.
 constexpr std::uint16_t DEFAULT_PORT = 9001;
 
+using Mpsc    = MpscRing<Order, RING_MPSC>;
 using Ingress = IngressRing<RING_IN>;
 using Egress  = EgressRing<RING_OUT>;
-using Gateway = TcpGateway<Sequencer<Ingress>>;
+using Gateway = TcpGateway<Mpsc>;
 
 // Signal -> gateway wake. The handler does only async-signal-safe work: an atomic store
 // and Gateway::stop() (a single write() to an eventfd).
@@ -108,35 +113,43 @@ int main(int argc, char** argv) {
         (argc > 1) ? static_cast<std::uint16_t>(std::atoi(argv[1])) : DEFAULT_PORT;
 
     try {
-        Ingress ingress;                                  // shared: gateway(main) -> matcher
-        Egress  egress;                                   // shared: matcher -> publisher
+        Mpsc    mpsc;                                     // inbound: gateway(s) -> sequencer
+        Ingress ingress;                                  // sequencer -> matcher
+        Egress  egress;                                   // matcher   -> publisher
         Journaler wal("titan.wal", WAL_CAP);
         Sequencer<Ingress> seq(ingress, wal);
 
         // Construct the gateway BEFORE spawning workers so a bind/listen failure exits
         // cleanly (no orphaned spin threads to join).
-        Gateway gw(port, seq);
+        Gateway gw(port, mpsc);
         g_gateway = &gw;
         install_signal_handlers();
 
-        std::atomic<bool> gateway_stopped{false};         // set once gw.run() returns (no more ingress)
-        std::atomic<bool> matcher_done{false};            // set once matcher drains ingress
+        std::atomic<bool> gateway_stopped{false};         // set once gw.run() returns (no more MPSC producers)
+        std::atomic<bool> sequencer_done{false};          // set once Sequencer drains the MPSC ring
+        std::atomic<bool> matcher_done{false};            // set once Matcher drains the ingress ring
 
-        // ---- T2: Matcher (arena/book are thread-local, as in the pipeline bench) ----
+        // ---- T2: Sequencer -- drains MPSC, stamps seq, journals, forwards to ingress ----
+        std::thread sequencer_thread([&] {
+            seq.run(mpsc, gateway_stopped);               // exits when gateway_stopped && MPSC drained
+            sequencer_done.store(true, std::memory_order_release);
+        });
+
+        // ---- T3: Matcher (arena/book are thread-local, as in the pipeline bench) ----
         std::thread matcher_thread([&] {
             Arena arena(ARENA_BYTES);
             OrderBook book(arena, MAX_NODES, ID_CAP);
             Matcher matcher(book);
             EgressSink sink{egress, {}};
             sink.buf.reserve(EgressSink::HWM);
-            while (!gateway_stopped.load(std::memory_order_acquire) || !ingress.empty_approx()) {
+            while (!sequencer_done.load(std::memory_order_acquire) || !ingress.empty_approx()) {
                 ingress.consume_batch([&](const Order& in) { matcher.submit(in, sink); });
                 sink.flush();                             // push this batch's trades to egress
             }
             matcher_done.store(true, std::memory_order_release);
         });
 
-        // ---- T3: Publisher (counter/checksum; periodic stdout, no per-trade I/O) ----
+        // ---- T4: Publisher (counter/checksum; periodic stdout, no per-trade I/O) ----
         std::thread publisher_thread([&] {
             std::uint64_t fills = 0, rejects = 0, chk = 0;
             while (!matcher_done.load(std::memory_order_acquire) || !egress.empty_approx()) {
@@ -157,15 +170,16 @@ int main(int argc, char** argv) {
 
         // ---- T1: Gateway on the main thread; blocks until a signal calls stop() ----
         std::printf("[titan-server] listening on 127.0.0.1:%u  "
-                    "(ingress=%zu egress=%zu slots, WAL cap=%llu orders)\n",
-                    gw.port(), RING_IN, RING_OUT, (unsigned long long)WAL_CAP);
-        std::printf("[titan-server] send raw 40-byte Order structs; Ctrl-C (SIGINT) to stop.\n");
+                    "(mpsc=%zu ingress=%zu egress=%zu slots, WAL cap=%llu orders)\n",
+                    gw.port(), RING_MPSC, RING_IN, RING_OUT, (unsigned long long)WAL_CAP);
+        std::printf("[titan-server] 4-thread pipeline up; send raw 40-byte Orders; Ctrl-C to stop.\n");
         std::fflush(stdout);
 
         gw.run();
 
-        std::printf("[titan-server] signal received; draining pipeline...\n");
-        gateway_stopped.store(true, std::memory_order_release);
+        std::printf("[titan-server] signal received; cascading shutdown...\n");
+        gateway_stopped.store(true, std::memory_order_release);   // -> Sequencer drains -> Matcher -> Publisher
+        sequencer_thread.join();
         matcher_thread.join();
         publisher_thread.join();
 
