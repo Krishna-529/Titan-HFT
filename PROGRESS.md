@@ -12,7 +12,7 @@ components land.
 |---|---|---|---|---|
 | UI / Localhost / Sim 1 / Sim 2 | ❌ | — | — | No UI/simulator in C++ v1 |
 | TCP + Kernel Bypassing | 🟡 | (uncommitted) | 2026-07-13 | TCP ingress done; **kernel-bypass (io_uring/DPDK) not started** |
-| **Gateway** | 🟡 | v1.3.4 (batched v1.3.6; MPSC v1.4.2) | 2026-07-13 | Edge-triggered **epoll** TCP ingress (`net/tcp_gateway.hpp`): `accept4`+`SOCK_NONBLOCK`, `TCP_NODELAY`, `eventfd` stop, RAII fd cleanup. **Batched recv** (4 KB/syscall). Pure I/O: pushes parsed Orders onto the inbound **MpscRing** (zero-drop `try_publish`), no seq/journal. Test: 10k intact/in-order + fd-leak. Multi-connection ready; still one listener |
+| **Gateway** | ✅ | v1.3.4 (batched v1.3.6; MPSC v1.4.2; multi v1.4.3) | 2026-07-13 | Edge-triggered **epoll** TCP ingress (`net/tcp_gateway.hpp`): `accept4`+`SOCK_NONBLOCK`, `TCP_NODELAY`, `eventfd` stop, RAII fd cleanup. **Batched recv** (4 KB/syscall). Pure I/O: pushes parsed Orders onto the inbound **MpscRing** (zero-drop `try_publish`), no seq/journal. **Multi-gateway fan-in**: N listeners (one epoll thread each) → 1 shared MpscRing, proven zero-loss under concurrent contention |
 | **Ingress Queue (LMAX Disruptor)** | ✅ | v1.2.0/1.4.1 (wired v1.4.2) | 2026-07-13 | SPSC ring (`spsc_ring.hpp`): batch-drain + prefetch, TSan-proven. **MPSC ring** (`mpsc_ring.hpp`): Vyukov CAS-claim + per-cell published-seq, TSan-proven (4P/1C, 1M, exactly-once). **Both wired into `titan-server`**: Gateway→MpscRing→Sequencer→IngressRing(SPSC)→Matcher |
 | **Matching Engine (using PIN)** | ✅ | v1.1.2–v1.1.4 (+hardening v1.3.3) | 2026-07-13 | PIN book, dense-slab O(1) id index, intrusive RB-tree price index, LIMIT/MARKET/IOC + partial fills. **Zero-crash under pool/arena exhaustion**: `submit` degrades to a `TRADE_STATUS_REJECTED` event (never terminates); construction is fail-fast |
 | **Sequencer** | ✅ | v1.3.2 (run-loop v1.4.2) | 2026-07-13 | Real component (`pipeline/sequencer.hpp`): seq-stamp → **write-ahead journal** → publish, zero-drop backpressure + durability cadence. `publish()` (recovery/tests) + active `run(mpsc, stop_flag)` drain loop (server T2: MpscRing → IngressRing, clean-shutdown flag) |
@@ -21,7 +21,7 @@ components land.
 | Publish Data / Trade Reporter | 🟡 | v1.2.4 (in server v1.3.6) | 2026-07-13 | Publisher thread `consume_batch`-drains egress → counter/checksum, logs every 100,000th event (fills/rejects). Real fan-out / Trade Reporter TBD |
 | UDP / TCP feedback → UI | ❌ | — | — | — |
 | **Power-failure recovery** | 🟡 | v1.3.2 | 2026-07-13 | `replay()` rebuilds book from WAL; torn-tail boundary via `seq==base+i` invariant (id-scheme & `count`-independent); empty-WAL no-op; idempotent. Bounded loss window between MS_SYNC checkpoints |
-| **Server `main()` executable** | 🟡 | v1.3.6 (4-thread v1.4.2) | 2026-07-13 | `src/main.cpp` → `titan-server` (`server.sh`, RELEASE). **4-thread** topology: Gateway(T1)→MpscRing→Sequencer(T2)→IngressRing→Matcher(T3)→EgressRing→Publisher(T4). SIGINT/SIGTERM **cascading** drain. Smoke-tested 250k → 152,777 trades (identical to 3-thread run), journaled, exit 0. Single-symbol, no config file |
+| **Server `main()` executable** | 🟡 | v1.3.6 (4-thread v1.4.2; multi-gw v1.4.3) | 2026-07-13 | `src/main.cpp` → `titan-server` (`server.sh`, RELEASE). **N-gateway** topology: `titan-server <port...>` → k gateway threads → 1 MpscRing → Sequencer → Ingress → Matcher → Egress → Publisher. SIGINT/SIGTERM **cascading** drain (stop+join all gateways → drain). Concurrent 2×125k blast: **exactly 250k journaled, zero loss**, exit 0. Single-symbol, no config file |
 
 ## Verified performance (WSL2, g++ 13, -O3 -march=native)
 
@@ -75,7 +75,8 @@ ratio (+ identical trade checksums for correctness). Ring overheads, thermal-inv
 | *(pending)* v1.3.4 | 2026-07-13 | Edge-triggered epoll TCP ingress Gateway (`net/tcp_gateway.hpp`) + 10k-order end-to-end test (intact/in-seq + fd-leak) |
 | v1.3.6 | 2026-07-13 | Gateway batched recv (4 KB/syscall); `titan-server` executable (`src/main.cpp`, `server.sh`) — 3-thread topology + graceful SIGINT/SIGTERM drain |
 | v1.4.1 | 2026-07-13 | MPSC lock-free ring (`mpsc_ring.hpp`, Vyukov CAS-claim + per-cell published-seq); TSan gate — 4 producers / 1 consumer, 1M items, exactly-once, zero races |
-| *(uncommitted)* v1.4.2 | 2026-07-13 | Wire MPSC into the pipeline: Sequencer `run()` drain-loop, Gateway → MpscRing, 4-thread `titan-server` with cascading shutdown (smoke-tested 250k, race-free) |
+| v1.4.2 | 2026-07-13 | Wire MPSC into the pipeline: Sequencer `run()` drain-loop, Gateway → MpscRing, 4-thread `titan-server` with cascading shutdown (smoke-tested 250k, race-free) |
+| *(uncommitted)* v1.4.3 | 2026-07-13 | Multi-gateway fan-in: `titan-server <port...>` spins N gateway threads onto one shared MpscRing; cascade stops+joins all gateways first. Concurrent 2×125k blast → exactly 250k journaled, zero loss |
 
 ## Planned build order
 1. ~~Wire the egress ring into the matcher~~ ✅ v1.2.4 + `publish_batch`
@@ -84,6 +85,6 @@ ratio (+ identical trade checksums for correctness). Ring overheads, thermal-inv
 4. ~~Matcher graceful degradation under pool/arena exhaustion (REJECTED event, never terminate)~~ ✅ v1.3.3
 5. ~~TCP ingress Gateway (epoll, edge-triggered → Sequencer)~~ ✅ v1.3.4 (UDP publish + kernel-bypass still TODO)
 6. ~~Server `main()`: gateway + sequencer + matcher + egress threads (real, not a bench)~~ ✅ v1.3.6 (`titan-server`, graceful shutdown)
-7. ~~MPSC ingress ring primitive~~ ✅ v1.4.1 + ~~wire into pipeline (4-thread server)~~ ✅ v1.4.2 — multi-gateway/multi-connection fan-in onto the one MpscRing still TODO
+7. ~~MPSC ingress ring primitive~~ ✅ v1.4.1 + ~~wire into pipeline~~ ✅ v1.4.2 + ~~multi-gateway fan-in~~ ✅ v1.4.3 (N listeners → 1 MpscRing, zero-loss under contention)
 8. UDP market-data publish; kernel-bypass (io_uring/DPDK)
 9. UI / market-data feed
