@@ -194,14 +194,18 @@ public:
         std::pair<PriceTick, PriceLevel>& operator*()  const noexcept { return  t_->nodes_[i_].kv; }
         bool operator==(const iterator& o) const noexcept { return i_ == o.i_; }
         bool operator!=(const iterator& o) const noexcept { return i_ != o.i_; }
+        // Forward, in-order (by Compare) via the successor link: begin()..end() walks every
+        // level best-first (highest bid / lowest ask first). Used by OrderBook::serialize_l2.
+        iterator& operator++() noexcept { i_ = t_->nodes_[i_].succ; return *this; }
         std::uint32_t node() const noexcept { return i_; }
     };
 
     iterator end()   noexcept { return iterator(this, NIL); }
     iterator begin() noexcept { return iterator(this, begin_); }
-    // const overload for read-only best_bid()/best_ask(); the returned iterator is
-    // only dereferenced for reading (const_cast is safe here).
+    // const overloads for read-only walks (best_bid()/best_ask(), OrderBook::serialize_l2);
+    // the returned iterator is only dereferenced for reading (const_cast is safe here).
     iterator begin() const noexcept { return iterator(const_cast<RBPriceIndex*>(this), begin_); }
+    iterator end()   const noexcept { return iterator(const_cast<RBPriceIndex*>(this), NIL); }
     bool     empty() const noexcept { return size_ == 0; }
     std::size_t size() const noexcept { return size_; }
 

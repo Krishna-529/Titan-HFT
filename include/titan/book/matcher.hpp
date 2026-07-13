@@ -97,7 +97,7 @@ private:
         if (r.rejected) return;
         r.rejected = true;
         const TradeEvent ev{
-            in.id, 0, in.price, 0,
+            in.id, 0, in.price, in.seq, 0,
             in.side, TRADE_STATUS_REJECTED, {0, 0}};
         while (!sink.try_publish(ev)) { /* zero-drop: spin until space clears */ }
     }
@@ -193,7 +193,7 @@ private:
               bool taker_buy, Qty qty, MatchResult& r) noexcept {
         ++r.trades;
         const TradeEvent ev{
-            taker.id, maker.id, maker.price, qty,
+            taker.id, maker.id, maker.price, taker.seq, qty,
             taker_buy ? Side::BUY : Side::SELL, TRADE_STATUS_FILL, {0, 0}};
         while (!sink.try_publish(ev)) { /* zero-drop: spin until space clears */ }
     }

@@ -93,14 +93,30 @@ public:
         }
     }
 
+    // Send ONE self-contained datagram of raw bytes (e.g. an L2 SnapshotBuffer). Best-effort,
+    // non-blocking; caller keeps `bytes` <= one MTU-safe payload (depth-limited snapshot) so no
+    // IP fragmentation. Returns true if the datagram was handed to the kernel.
+    bool send_raw(const void* data, std::size_t bytes) noexcept {
+        for (;;) {
+            const ssize_t s = ::sendto(fd_, data, bytes, 0,
+                                       reinterpret_cast<const sockaddr*>(&dst_), sizeof(dst_));
+            if (s < 0 && errno == EINTR) continue;
+            if (s == static_cast<ssize_t>(bytes)) { ++datagrams_; return true; }
+            ++drops_;
+            return false;
+        }
+    }
+
     std::uint64_t sent()      const noexcept { return sent_; }       // TradeEvents sent
     std::uint64_t dropped()   const noexcept { return dropped_; }    // TradeEvents dropped (buffer full)
     std::uint64_t datagrams() const noexcept { return datagrams_; }  // datagrams transmitted
     std::uint64_t drops()     const noexcept { return drops_; }      // datagrams dropped
 
 private:
-    // 32-byte TradeEvent: 45 per datagram = 1440 B payload, under the 1500 B Ethernet MTU.
-    static constexpr std::size_t TRADES_PER_DGRAM = 45;
+    // Keep each datagram under the 1500 B Ethernet MTU (no IP fragmentation): payload budget
+    // 1440 B / sizeof(TradeEvent) events per datagram.
+    static constexpr std::size_t MAX_DGRAM_BYTES  = 1440;
+    static constexpr std::size_t TRADES_PER_DGRAM = MAX_DGRAM_BYTES / sizeof(TradeEvent);
 
     int           fd_        = -1;
     sockaddr_in   dst_{};

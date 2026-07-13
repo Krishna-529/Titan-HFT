@@ -35,7 +35,7 @@ struct VecSink {
 
 // ------------------------------------------------------------ TradeEvent POD
 TEST_CASE(trade_event_is_pod_and_sized) {
-    CHECK(sizeof(TradeEvent) == 32);
+    CHECK(sizeof(TradeEvent) == 40);
     CHECK(std::is_trivially_copyable_v<TradeEvent>);
 }
 

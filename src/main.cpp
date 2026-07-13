@@ -27,6 +27,7 @@
 
 #include "titan/book/matcher.hpp"
 #include "titan/book/order_book.hpp"
+#include "titan/book/snapshot.hpp"
 #include "titan/book/trade_event.hpp"
 #include "titan/io/journaler.hpp"
 #include "titan/memory/arena.hpp"
@@ -36,6 +37,7 @@
 #include "titan/pipeline/sequencer.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -65,18 +67,27 @@ constexpr std::uint64_t WAL_CAP      = 1u << 22;         // ~4.2M orders (~160 M
 constexpr std::uint16_t DEFAULT_PORT = 9001;
 constexpr int           MAX_GATEWAYS = 16;
 
-// Outbound market-data multicast (Publisher). MCAST_IF = "127.0.0.1" routes the feed over
-// loopback so a same-host listener receives it; set to a NIC IP for real network fan-out.
-const char*             MCAST_GROUP  = "239.1.1.1";
-constexpr std::uint16_t MCAST_PORT   = 30001;
-const char*             MCAST_IF     = "127.0.0.1";
-constexpr int           MCAST_TTL    = 1;
-constexpr std::size_t   PUB_HWM      = 1u << 12;         // publisher drains egress in 4096-trade waves
+// Outbound market-data multicast. MCAST_IF = "127.0.0.1" routes the feeds over loopback so a
+// same-host listener receives them; set to a NIC IP for real network fan-out. TWO channels:
+// the low-latency INCREMENTAL trade feed (MCAST_PORT) and the periodic SNAPSHOT feed (MCAST_SNAP_PORT).
+const char*             MCAST_GROUP     = "239.1.1.1";
+constexpr std::uint16_t MCAST_PORT      = 30001;        // incremental trade feed
+constexpr std::uint16_t MCAST_SNAP_PORT = 30002;        // L2 snapshot feed (gap-fill / late-join)
+const char*             MCAST_IF        = "127.0.0.1";
+constexpr int           MCAST_TTL       = 1;
+constexpr std::size_t   PUB_HWM         = 1u << 12;      // publisher drains egress in 4096-trade waves
 
-using Mpsc    = MpscRing<Order, RING_MPSC>;
-using Ingress = IngressRing<RING_IN>;
-using Egress  = EgressRing<RING_OUT>;
-using Gateway = TcpGateway<Mpsc>;
+// L2 snapshot: top 28 levels/side -> 64 + 56*24 = 1408 B, one MTU-safe datagram. Emitted every
+// SNAPSHOT_EVERY matched orders via a cheap modulo on the matcher's drain loop (no timers).
+constexpr std::size_t   SNAP_MAX_LEVELS = 56;
+constexpr std::size_t   SNAP_SLOTS      = 3;
+constexpr std::uint64_t SNAPSHOT_EVERY  = 10000;        // K
+
+using Mpsc     = MpscRing<Order, RING_MPSC>;
+using Ingress  = IngressRing<RING_IN>;
+using Egress   = EgressRing<RING_OUT>;
+using Gateway  = TcpGateway<Mpsc>;
+using SnapPool = SnapshotPool<SNAP_MAX_LEVELS, SNAP_SLOTS>;
 
 // Signal -> stop EVERY gateway. Async-signal-safe: only atomic loads + Gateway::stop()
 // (one write() to an eventfd) over a fixed array (no std::vector internals in the handler).
@@ -140,6 +151,7 @@ int main(int argc, char** argv) {
         Egress  egress;                                   // matcher   -> publisher
         Journaler wal("titan.wal", WAL_CAP);
         Sequencer<Ingress> seq(ingress, wal);
+        auto    snap_pool = std::make_unique<SnapPool>(); // matcher(T3, writer) -> snapshot(T5, reader)
 
         // Construct every gateway BEFORE spawning threads so a bind/listen failure exits
         // cleanly (no orphaned spin threads to join). All share the one MpscRing.
@@ -163,14 +175,22 @@ int main(int argc, char** argv) {
         });
 
         // ---- Matcher (arena/book are thread-local, as in the pipeline bench) ----
+        // Also the snapshot WRITER: every SNAPSHOT_EVERY matched orders it serializes a
+        // consistent L2 image (as-of that order's seq) into a free pool buffer (best-effort;
+        // skips if all buffers are held by T5). A cheap modulo -> no timer, no hot-path syscall.
         std::thread matcher_thread([&] {
             Arena arena(ARENA_BYTES);
             OrderBook book(arena, MAX_NODES, ID_CAP);
             Matcher matcher(book);
             EgressSink sink{egress, {}};
             sink.buf.reserve(EgressSink::HWM);
+            std::uint64_t processed = 0;
             while (!sequencer_done.load(std::memory_order_acquire) || !ingress.empty_approx()) {
-                ingress.consume_batch([&](const Order& in) { matcher.submit(in, sink); });
+                ingress.consume_batch([&](const Order& in) {
+                    matcher.submit(in, sink);
+                    if (++processed % SNAPSHOT_EVERY == 0)
+                        snap_pool->try_snapshot([&](SnapPool::Buffer& b) { book.serialize_l2(b, in.seq); });
+                });
                 sink.flush();
             }
             matcher_done.store(true, std::memory_order_release);
@@ -203,6 +223,34 @@ int main(int argc, char** argv) {
                         (unsigned long long)udp.datagrams(), MCAST_GROUP, MCAST_PORT, MCAST_IF);
         });
 
+        // ---- T5 Snapshot thread: hazard-claim the latest L2 image and multicast it on the
+        //      SEPARATE snapshot channel, so the periodic (fat) snapshot never head-of-line-
+        //      blocks the latency-critical incremental trade feed. Sends only NEW snapshots.
+        std::thread snapshot_thread([&] {
+            UdpPublisher snap_udp(MCAST_GROUP, MCAST_SNAP_PORT, MCAST_IF, MCAST_TTL);
+            std::uint64_t last_seq = ~0ull;   // sentinel: first published snapshot always sends
+            std::uint64_t sent = 0;
+            int idx = -1;
+            auto send_latest = [&] {
+                const SnapPool::Buffer* b = snap_pool->acquire(idx);
+                if (b == nullptr) return;
+                if (b->header.feed_seq != last_seq) {          // only transmit a fresh generation
+                    const std::size_t bytes = sizeof(SnapshotHeader)
+                        + static_cast<std::size_t>(b->header.level_count) * sizeof(SnapshotLevel);
+                    if (snap_udp.send_raw(b, bytes)) { ++sent; last_seq = b->header.feed_seq; }
+                }
+                snap_pool->release(idx);
+            };
+            while (!matcher_done.load(std::memory_order_acquire)) {
+                send_latest();
+                std::this_thread::sleep_for(std::chrono::microseconds(250));   // low-freq poll (~4 kHz)
+            }
+            send_latest();                                     // final snapshot after the writer stops
+            std::printf("[snapshot] FINAL snapshots_sent=%llu datagrams=%llu drops=%llu (%s:%u via %s)\n",
+                        (unsigned long long)sent, (unsigned long long)snap_udp.datagrams(),
+                        (unsigned long long)snap_udp.drops(), MCAST_GROUP, MCAST_SNAP_PORT, MCAST_IF);
+        });
+
         // ---- Gateways: one epoll thread each, all feeding the shared MpscRing ----
         std::vector<std::thread> gateway_threads;
         gateway_threads.reserve(gateways.size());
@@ -213,19 +261,21 @@ int main(int argc, char** argv) {
 
         std::printf("[titan-server] listening on %zu port(s):", ports.size());
         for (const std::uint16_t p : ports) std::printf(" 127.0.0.1:%u", p);
-        std::printf("\n[titan-server] %zu gateway thread(s) -> 1 MpscRing (mpsc=%zu ingress=%zu egress=%zu, "
-                    "WAL cap=%llu). Ctrl-C to stop.\n",
-                    gateways.size(), RING_MPSC, RING_IN, RING_OUT, (unsigned long long)WAL_CAP);
+        std::printf("\n[titan-server] %zu gateway thread(s) -> 1 MpscRing; feeds: trades %s:%u, "
+                    "snapshot %s:%u (every %llu orders). Ctrl-C to stop.\n",
+                    gateways.size(), MCAST_GROUP, MCAST_PORT, MCAST_GROUP, MCAST_SNAP_PORT,
+                    (unsigned long long)SNAPSHOT_EVERY);
         std::fflush(stdout);
 
         // Block until SIGINT/SIGTERM stops every gateway; each gw.run() then returns.
         for (auto& t : gateway_threads) t.join();
 
         std::printf("[titan-server] all gateways stopped; cascading drain...\n");
-        gateway_stopped.store(true, std::memory_order_release);   // -> Sequencer -> Matcher -> Publisher
+        gateway_stopped.store(true, std::memory_order_release);   // -> Sequencer -> Matcher -> {Publisher, Snapshot}
         sequencer_thread.join();
-        matcher_thread.join();
+        matcher_thread.join();                                    // sets matcher_done -> T4 & T5 wind down
         publisher_thread.join();
+        snapshot_thread.join();
 
         std::printf("[titan-server] shutdown complete. journaled %llu orders to titan.wal\n",
                     (unsigned long long)wal.count());

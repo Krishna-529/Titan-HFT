@@ -26,6 +26,7 @@
 #include "titan/book/pin_node.hpp"
 #include "titan/book/price_level.hpp"
 #include "titan/book/rb_price_index.hpp"
+#include "titan/book/snapshot.hpp"
 #include "titan/domain/types.hpp"
 #include "titan/memory/arena.hpp"
 
@@ -125,6 +126,40 @@ public:
     std::size_t   active_orders() const noexcept { return live_count_; }
     std::uint32_t free_node_count() const noexcept {
         return static_cast<std::uint32_t>(free_nodes_.size());
+    }
+
+    // Serialize an L2 (price, total_qty, order_count) image of the top `MaxLevels/2` levels per
+    // side into `buf`, tagged with `feed_seq` (the Sequencer seq this image is consistent as-of).
+    // Bids best-first (highest), then asks best-first (lowest). Called ONLY by the owning matcher
+    // thread (single writer of the book) -> no locking; noexcept, no allocation. Depth-limited so
+    // the whole buffer fits one MTU-safe datagram.
+    template <std::size_t MaxLevels>
+    void serialize_l2(SnapshotBuffer<MaxLevels>& buf, std::uint64_t feed_seq) const noexcept {
+        const std::uint32_t half = static_cast<std::uint32_t>(MaxLevels / 2);
+        std::uint32_t n = 0, nb = 0, na = 0;
+        std::uint64_t chk = 0;
+
+        auto emit_level = [&](const PriceLevel& lvl, std::uint8_t side) {
+            SnapshotLevel& L = buf.levels[n];
+            L.price       = lvl.price;
+            L.total_qty   = lvl.total_qty;
+            L.order_count = lvl.order_count;
+            L.side        = side;
+            L._pad[0] = L._pad[1] = L._pad[2] = 0;
+            chk += static_cast<std::uint64_t>(L.price) + L.total_qty + L.order_count + L.side;
+            ++n;
+        };
+        for (auto it = bids_.begin(); it != bids_.end() && nb < half; ++it) { emit_level(it->second, 0); ++nb; }
+        for (auto it = asks_.begin(); it != asks_.end() && na < half; ++it) { emit_level(it->second, 1); ++na; }
+
+        buf.header.magic       = SNAPSHOT_MAGIC;
+        buf.header.version     = SNAPSHOT_VERSION;
+        buf.header.level_count = n;
+        buf.header.feed_seq    = feed_seq;
+        buf.header.bid_levels  = nb;
+        buf.header.ask_levels  = na;
+        buf.header.checksum    = chk;
+        for (std::size_t i = 0; i < sizeof(buf.header._reserved); ++i) buf.header._reserved[i] = 0;
     }
 
 private:
