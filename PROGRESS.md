@@ -20,6 +20,7 @@ components land.
 | **Egress Queue (LMAX Disruptor)** | 🟡 | v1.2.4 (+batch) | 2026-07-13 | **Wired**: matcher **batch-publishes** trades (thread-local buffer → `publish_batch`, one release-store/batch, zero-drop). SPSC |
 | Publish Data / Trade Reporter | ✅ | v1.4.4 | 2026-07-13 | **UDP multicast** market data (`net/udp_publisher.hpp`): non-blocking socket, `IP_MULTICAST_IF/TTL/LOOP`, raw-binary TradeEvents (zero JSON), MTU-safe datagram chunking (45/dgram), best-effort drop-on-full. Publisher(T4) drains egress → `udp.publish(batch)`. Verified: external listener decoded 122,223 TradeEvents, zero loss |
 | UDP / TCP feedback → UI | 🟡 | v1.4.4 | 2026-07-13 | Outbound UDP market-data multicast live (see above). UI/simulator consumer + TCP order-ack feedback still absent |
+| **Snapshot & Gap-Fill** | 🟡 | v1.4.6 | 2026-07-13 | L2 snapshot primitive (`book/snapshot.hpp`): `SnapshotLevel`/`SnapshotHeader` + lock-free **triple-buffer pool** (per-buffer seq_cst `in_use` flags + `published` atomic; writer wait-free, skips if all busy). **TSan-proven** (1W/1R, 1M generations, 0 torn, 0 races). **Not yet wired** into main (needs Matcher serialize hook + T5 snapshot thread + 2nd multicast channel + `feed_seq` on events) |
 | **Power-failure recovery** | 🟡 | v1.3.2 | 2026-07-13 | `replay()` rebuilds book from WAL; torn-tail boundary via `seq==base+i` invariant (id-scheme & `count`-independent); empty-WAL no-op; idempotent. Bounded loss window between MS_SYNC checkpoints |
 | **Server `main()` executable** | 🟡 | v1.3.6 (4-thread v1.4.2; multi-gw v1.4.3) | 2026-07-13 | `src/main.cpp` → `titan-server` (`server.sh`, RELEASE). **N-gateway** topology: `titan-server <port...>` → k gateway threads → 1 MpscRing → Sequencer → Ingress → Matcher → Egress → Publisher. SIGINT/SIGTERM **cascading** drain (stop+join all gateways → drain). Concurrent 2×125k blast: **exactly 250k journaled, zero loss**, exit 0. Single-symbol, no config file |
 
@@ -78,7 +79,8 @@ ratio (+ identical trade checksums for correctness). Ring overheads, thermal-inv
 | v1.4.2 | 2026-07-13 | Wire MPSC into the pipeline: Sequencer `run()` drain-loop, Gateway → MpscRing, 4-thread `titan-server` with cascading shutdown (smoke-tested 250k, race-free) |
 | v1.4.3 | 2026-07-13 | Multi-gateway fan-in: `titan-server <port...>` spins N gateway threads onto one shared MpscRing; cascade stops+joins all gateways first. Concurrent 2×125k blast → exactly 250k journaled, zero loss |
 | v1.4.4 | 2026-07-13 | UDP multicast Publisher (`net/udp_publisher.hpp`): raw-binary TradeEvent fan-out, non-blocking, MTU-safe. Publisher(T4) rewired egress → multicast. Verified end-to-end: external listener decoded 122,223 TradeEvents, zero loss |
-| *(uncommitted)* v1.4.5 | 2026-07-13 | Permanent multicast harness (`tests/mc_listener.py` + `tests/multicast_test.sh`): self-contained build + blast + external-listener verify (graceful exit on count/idle). Snapshot & gap-fill = design phase (no code yet) |
+| v1.4.5 | 2026-07-13 | Permanent multicast harness (`tests/mc_listener.py` + `tests/multicast_test.sh`): self-contained build + blast + external-listener verify (graceful exit on count/idle) |
+| *(uncommitted)* v1.4.6 | 2026-07-13 | L2 snapshot primitive + lock-free triple-buffer pool (`book/snapshot.hpp`, seq_cst `in_use` reclamation); TSan gate 1W/1R × 1M generations, 0 torn / 0 races. Not yet wired into the server |
 
 ## Planned build order
 1. ~~Wire the egress ring into the matcher~~ ✅ v1.2.4 + `publish_batch`

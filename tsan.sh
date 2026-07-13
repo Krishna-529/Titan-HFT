@@ -39,4 +39,14 @@ mkdir -p build
     else
         echo "COMPILE_FAILED"
     fi
+
+    echo "== building snapshot_tests (ThreadSanitizer) =="
+    if "$CXX" "${FLAGS[@]}" tests/snapshot_tests.cpp -o build/snap_tsan; then
+        echo "COMPILE_OK"
+        echo "== running snapshot (TSan; ASLR disabled via setarch -R) =="
+        setarch "$(uname -m)" -R ./build/snap_tsan
+        echo "SNAP_RUN_EXIT=$?"
+    else
+        echo "COMPILE_FAILED"
+    fi
 } 2>&1 | tee build/tsan.log
