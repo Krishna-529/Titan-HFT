@@ -7,7 +7,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CXX="${CXX:-g++}"
-FLAGS=(-std=c++20 -Wall -Wextra -Wpedantic -Iinclude
+FLAGS=(-std=c++20 -Wall -Wextra -Wpedantic -Iinclude -D_DEFAULT_SOURCE
        -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer)
 
 mkdir -p build
@@ -15,7 +15,7 @@ mkdir -p build
     echo "== compiler =="
     "$CXX" --version | head -1
     echo "== compiling tests (ASan+UBSan) =="
-    if "$CXX" "${FLAGS[@]}" tests/tests.cpp tests/matcher_tests.cpp tests/rb_tree_tests.cpp -o build/titan_tests; then
+    if "$CXX" "${FLAGS[@]}" tests/tests.cpp tests/matcher_tests.cpp tests/rb_tree_tests.cpp tests/journaler_tests.cpp -o build/titan_tests; then
         echo "COMPILE_OK"
         echo "== running tests =="
         ./build/titan_tests
