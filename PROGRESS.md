@@ -77,7 +77,8 @@ ratio (+ identical trade checksums for correctness). Ring overheads, thermal-inv
 | v1.4.1 | 2026-07-13 | MPSC lock-free ring (`mpsc_ring.hpp`, Vyukov CAS-claim + per-cell published-seq); TSan gate — 4 producers / 1 consumer, 1M items, exactly-once, zero races |
 | v1.4.2 | 2026-07-13 | Wire MPSC into the pipeline: Sequencer `run()` drain-loop, Gateway → MpscRing, 4-thread `titan-server` with cascading shutdown (smoke-tested 250k, race-free) |
 | v1.4.3 | 2026-07-13 | Multi-gateway fan-in: `titan-server <port...>` spins N gateway threads onto one shared MpscRing; cascade stops+joins all gateways first. Concurrent 2×125k blast → exactly 250k journaled, zero loss |
-| *(uncommitted)* v1.4.4 | 2026-07-13 | UDP multicast Publisher (`net/udp_publisher.hpp`): raw-binary TradeEvent fan-out, non-blocking, MTU-safe. Publisher(T4) rewired egress → multicast. Verified end-to-end: external listener decoded 122,223 TradeEvents, zero loss |
+| v1.4.4 | 2026-07-13 | UDP multicast Publisher (`net/udp_publisher.hpp`): raw-binary TradeEvent fan-out, non-blocking, MTU-safe. Publisher(T4) rewired egress → multicast. Verified end-to-end: external listener decoded 122,223 TradeEvents, zero loss |
+| *(uncommitted)* v1.4.5 | 2026-07-13 | Permanent multicast harness (`tests/mc_listener.py` + `tests/multicast_test.sh`): self-contained build + blast + external-listener verify (graceful exit on count/idle). Snapshot & gap-fill = design phase (no code yet) |
 
 ## Planned build order
 1. ~~Wire the egress ring into the matcher~~ ✅ v1.2.4 + `publish_batch`
