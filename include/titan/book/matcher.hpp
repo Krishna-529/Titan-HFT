@@ -23,6 +23,7 @@
 // refills. Across nodes, the level's node chain is already oldest-first.
 //
 #include <cstdint>
+#include <new>          // std::bad_alloc (arena-exhaustion guard on the noexcept submit path)
 #include <type_traits>
 #include <vector>
 
@@ -41,6 +42,7 @@ struct MatchResult {
     Qty           residual = 0;      // quantity left over after crossing
     std::uint32_t trades   = 0;      // number of fills generated
     bool          rested   = false;  // residual added to the book (LIMIT only)
+    bool          rejected = false;  // residual could NOT be admitted (resource exhaustion) -> REJECTED event emitted
 };
 
 template <class BookT>
@@ -51,27 +53,55 @@ public:
     // Cross `in` against the book, publishing every fill to `sink` -- any type
     // exposing `bool try_publish(const TradeEvent&)` (the EgressRing in production, a
     // vector-backed collector in tests). Never throws, never OS-allocates, never crashes.
+    //
+    // ZERO-CRASH under resource exhaustion: the whole processing body is guarded. The one
+    // arena-allocating call on this path today, book_.add() (resting a residual), is
+    // pool-backed and returns false when the node/level pool is full -- we turn that into a
+    // graceful REJECTED event. The surrounding try/catch is defence-in-depth: it keeps
+    // submit()'s noexcept contract total should ANY future allocation on the crossing path
+    // (cross/sweep_level) ever throw std::bad_alloc, degrading to a rejection instead of
+    // std::terminate. The pipeline consumer therefore never sees stack unwinding.
     template <class Sink>
     MatchResult submit(Order in, Sink& sink) noexcept {
         MatchResult r{};
         const Qty original = in.remaining;
+        try {
+            if (in.remaining != 0) {
+                if (in.side == Side::BUY) cross(book_.asks_, in, /*taker_buy=*/true,  sink, r);
+                else                      cross(book_.bids_, in, /*taker_buy=*/false, sink, r);
+            }
 
-        if (in.remaining != 0) {
-            if (in.side == Side::BUY) cross(book_.asks_, in, /*taker_buy=*/true,  sink, r);
-            else                      cross(book_.bids_, in, /*taker_buy=*/false, sink, r);
-        }
+            r.filled   = static_cast<Qty>(original - in.remaining);
+            r.residual = in.remaining;
 
-        r.filled   = static_cast<Qty>(original - in.remaining);
-        r.residual = in.remaining;
-
-        // Residual handling: LIMIT rests the leftover; MARKET & IOC discard it.
-        if (in.remaining != 0 && in.type == OrderType::LIMIT) {
-            r.rested = book_.add(in);   // pool-backed rest; false only if pool exhausted
+            // Residual handling: LIMIT rests the leftover; MARKET & IOC discard it (by design).
+            if (in.remaining != 0 && in.type == OrderType::LIMIT) {
+                r.rested = book_.add(in);          // pool-backed rest; false only if pool/arena exhausted
+                if (!r.rested) emit_reject(sink, in, r);   // couldn't admit the residual -> reject it
+            }
+        } catch (const std::bad_alloc&) {
+            // Arena/pool exhaustion anywhere on the processing path -> graceful reject, never crash.
+            // Book state is unchanged: RBPriceIndex::alloc() throws BEFORE it mutates the tree.
+            r.rested = false;
+            emit_reject(sink, in, r);
         }
         return r;
     }
 
 private:
+    // Publish a REJECTED TradeEvent for an order the book could not admit (resource
+    // exhaustion). quantity == 0 and maker_id == 0 mark it as a non-fill; the consumer keys
+    // off status == TRADE_STATUS_REJECTED. Idempotent guard: only one rejection per order.
+    template <class Sink>
+    void emit_reject(Sink& sink, const Order& in, MatchResult& r) noexcept {
+        if (r.rejected) return;
+        r.rejected = true;
+        const TradeEvent ev{
+            in.id, 0, in.price, 0,
+            in.side, TRADE_STATUS_REJECTED, {0, 0}};
+        while (!sink.try_publish(ev)) { /* zero-drop: spin until space clears */ }
+    }
+
     // Walk the opposite book from best price outward, consuming liquidity while the
     // incoming order still crosses. `Map` is deduced as OrderBook's Bid/Ask map.
     template <class Map, class Sink>
@@ -164,7 +194,7 @@ private:
         ++r.trades;
         const TradeEvent ev{
             taker.id, maker.id, maker.price, qty,
-            taker_buy ? Side::BUY : Side::SELL, {0, 0, 0}};
+            taker_buy ? Side::BUY : Side::SELL, TRADE_STATUS_FILL, {0, 0}};
         while (!sink.try_publish(ev)) { /* zero-drop: spin until space clears */ }
     }
 

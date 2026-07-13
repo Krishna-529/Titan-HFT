@@ -13,13 +13,22 @@
 
 namespace titan {
 
+// TradeEvent::status values. FILL is the overwhelming common case (a real trade);
+// REJECTED is emitted by the matcher when an order cannot be admitted to the book under
+// resource exhaustion (node/level pool full or arena exhausted) -- a graceful, zero-crash
+// signal to the egress consumer instead of a silent drop. A REJECTED event carries the
+// aggressor's id + side, price = the order's price, and quantity == 0 (no liquidity traded).
+inline constexpr std::uint8_t TRADE_STATUS_FILL     = 0;
+inline constexpr std::uint8_t TRADE_STATUS_REJECTED = 1;
+
 struct TradeEvent {
     OrderId      taker_id;    // 8  aggressor (incoming) order id
-    OrderId      maker_id;    // 8  resting order that was hit
-    PriceTick    price;       // 8  execution price = resting (maker) price
-    Qty          quantity;    // 4  traded quantity
+    OrderId      maker_id;    // 8  resting order that was hit (0 on a rejection)
+    PriceTick    price;       // 8  execution price = resting (maker) price; order price on reject
+    Qty          quantity;    // 4  traded quantity (0 on a rejection)
     Side         taker_side;  // 1  aggressor side (BUY => buyer lifted an ask)
-    std::uint8_t _pad[3];     // 3  explicit padding -> deterministic 32-byte layout
+    std::uint8_t status;      // 1  TRADE_STATUS_FILL | TRADE_STATUS_REJECTED
+    std::uint8_t _pad[2];     // 2  explicit padding -> deterministic 32-byte layout
 };
 
 static_assert(sizeof(TradeEvent) == 32,                 "TradeEvent layout drift");

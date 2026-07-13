@@ -50,14 +50,21 @@ public:
     // `arena` backs the pmr price maps; `max_nodes` bounds the node pool
     // (=> up to max_nodes * NodeT::CAPACITY resting orders). `id_capacity`
     // sizes the id->locator slab; 0 => derive from the pool (max_nodes*CAPACITY).
-    OrderBookT(Arena& arena, std::uint32_t max_nodes, std::uint64_t id_capacity = 0)
+    // `level_capacity` bounds the number of simultaneously-active price levels PER SIDE
+    // (the arena-backed RB node pools). Default = the RBPriceIndex default. NOTE: the two
+    // RB pools are the dominant arena consumer (~level_capacity * sizeof(Node) * 2) and are
+    // allocated HERE, at construction -- size the arena to hold them or construction fails
+    // fast (by design: a book that cannot allocate its levels should fail loud at startup,
+    // before processing any order, not mid-stream).
+    OrderBookT(Arena& arena, std::uint32_t max_nodes, std::uint64_t id_capacity = 0,
+               std::size_t level_capacity = (std::size_t{1} << 16))
         : arena_(arena),
           nodes_(max_nodes),
           locators_(id_capacity ? id_capacity
                                  : static_cast<std::uint64_t>(max_nodes) * NodeT::CAPACITY,
                     SlabEntry{INVALID_INDEX, 0}),
-          bids_(std::greater<PriceTick>(), arena.pmr()),
-          asks_(std::less<PriceTick>(),    arena.pmr()) {
+          bids_(std::greater<PriceTick>(), arena.pmr(), level_capacity),
+          asks_(std::less<PriceTick>(),    arena.pmr(), level_capacity) {
         free_nodes_.reserve(max_nodes);
         for (std::uint32_t i = max_nodes; i-- > 0; ) free_nodes_.push_back(i);
     }

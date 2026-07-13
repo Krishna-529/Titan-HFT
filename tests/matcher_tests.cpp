@@ -299,3 +299,72 @@ TEST_CASE(intra_node_fifo_survives_cancel_and_refill) {
     CHECK(tr[2].maker_id == 4u);
     CHECK(book.active_orders() == 0u);
 }
+
+// ------------------------------------------------------------ ZERO-CRASH: graceful reject on
+// RB price-level pool exhaustion. This drives the *actual* std::bad_alloc path: a new price
+// level calls RBPriceIndex::alloc(), which throws when its pool free-list is empty. The matcher
+// must catch it, publish a REJECTED event, keep the book valid, and NOT terminate.
+TEST_CASE(matcher_rejects_gracefully_on_level_pool_exhaustion) {
+    Arena arena(1u * 1024 * 1024);
+    OrderBook book(arena, /*max_nodes=*/8, /*id_capacity=*/64, /*level_capacity=*/2);  // only 2 levels/side
+    Matcher m(book);
+    VecSink tr; tr.reserve(16);
+
+    // Two resting SELLs at distinct prices -> both RB level slots consumed.
+    MatchResult r1 = m.submit(mk(1, Side::SELL, 100, 5), tr);  CHECK(r1.rested);  CHECK(!r1.rejected);
+    MatchResult r2 = m.submit(mk(2, Side::SELL, 101, 5), tr);  CHECK(r2.rested);  CHECK(!r2.rejected);
+    CHECK(tr.empty());                                          // no crossings yet -> no events
+
+    // Third distinct price needs a 3rd level -> alloc() throws bad_alloc -> caught -> REJECTED.
+    MatchResult r3 = m.submit(mk(3, Side::SELL, 102, 5), tr);
+    CHECK(!r3.rested);                                          // could not be admitted
+    CHECK(r3.rejected);                                         // ... and said so
+    REQUIRE(tr.size() == 1u);                                   // exactly one rejection event
+    CHECK(tr[0].status   == TRADE_STATUS_REJECTED);
+    CHECK(tr[0].taker_id == 3u);
+    CHECK(tr[0].maker_id == 0u);
+    CHECK(tr[0].quantity == 0u);
+    CHECK(tr[0].price    == 102);
+    CHECK(tr[0].taker_side == Side::SELL);
+
+    // Book is still VALID for the next order: a crossing BUY hits resting SELL id1@100 -> real FILL.
+    MatchResult r4 = m.submit(mk(4, Side::BUY, 100, 5), tr);
+    CHECK(r4.filled == 5u);
+    CHECK(!r4.rejected);
+    REQUIRE(tr.size() == 2u);
+    CHECK(tr[1].status   == TRADE_STATUS_FILL);
+    CHECK(tr[1].maker_id == 1u);
+    CHECK(tr[1].taker_id == 4u);
+    CHECK(tr[1].quantity == 5u);
+    CHECK(book.active_orders() == 1u);                          // id2@101 still resting; consistent
+}
+
+// ------------------------------------------------------------ ZERO-CRASH: graceful reject on
+// PIN node-pool exhaustion (the non-exception path: alloc_node() returns INVALID_INDEX, add()
+// returns false without throwing). Same graceful-rejection contract.
+TEST_CASE(matcher_rejects_gracefully_on_node_pool_exhaustion) {
+    Arena arena(4u * 1024 * 1024);
+    OrderBook book(arena, /*max_nodes=*/1, /*id_capacity=*/64, /*level_capacity=*/16);  // ONE PIN node
+    Matcher m(book);
+    VecSink tr; tr.reserve(16);
+
+    MatchResult r1 = m.submit(mk(1, Side::SELL, 100, 5), tr);   // takes the only node
+    CHECK(r1.rested);  CHECK(!r1.rejected);
+
+    // Second level needs a second node -> pool empty -> add() returns false -> REJECTED.
+    MatchResult r2 = m.submit(mk(2, Side::SELL, 101, 5), tr);
+    CHECK(!r2.rested);
+    CHECK(r2.rejected);
+    REQUIRE(tr.size() == 1u);
+    CHECK(tr[0].status   == TRADE_STATUS_REJECTED);
+    CHECK(tr[0].taker_id == 2u);
+    CHECK(tr[0].quantity == 0u);
+
+    // Still valid: crossing BUY fills the resting SELL id1@100.
+    MatchResult r3 = m.submit(mk(3, Side::BUY, 100, 5), tr);
+    CHECK(r3.filled == 5u);
+    CHECK(!r3.rejected);
+    REQUIRE(tr.size() == 2u);
+    CHECK(tr[1].status == TRADE_STATUS_FILL);
+    CHECK(book.active_orders() == 0u);
+}
