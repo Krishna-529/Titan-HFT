@@ -32,14 +32,27 @@
 
 namespace titan {
 
-// Dense-slab entry: where a live order physically sits. node == INVALID_INDEX
-// means the id is not live (free slab slot). Kept to 8 bytes -> one cache line
-// holds 8 entries; price/side are read back from the Order on cancel (we touch
-// the node anyway), so they need not be duplicated here.
-struct SlabEntry {
-    std::uint32_t node;   // PIN_Node pool index
-    std::uint32_t slot;   // slot within the node [0, CAPACITY)
+// Dense-slab entry: where a live order sits, PLUS the cancel-hot fields cached inline.
+// node == INVALID_INDEX means the id is not live (free slab slot).
+//
+// CACHE-LOCALITY (profile-driven): the earlier 8-byte entry made cancel chase id-slab ->
+// PIN_Node -> the cold 2.5 KB `slots` payload to read price/qty/side (that `at()` load was
+// ~27% of engine time). We now cache price/remaining/side here, so a cancel/lookup is
+// satisfied from THIS single 32-byte, cache-line-aligned entry by pure id-indexed arithmetic
+// -- no chase into the node's slot payload. `alignas(32)` guarantees an entry never straddles
+// a cache line (one line pulled per lookup, no split). `remaining` is mutable (partial fills),
+// so the matcher keeps it in sync via note_partial_fill().
+struct alignas(32) SlabEntry {
+    std::uint32_t node;        // 4  PIN_Node pool index (INVALID_INDEX = free)
+    std::uint32_t slot;        // 4  slot within the node [0, CAPACITY)
+    PriceTick     price;       // 8  cached resting price   (RB level lookup on cancel)
+    Qty           remaining;   // 4  cached resting qty      (level total_qty adjust; synced on partial fill)
+    Side          side;        // 1  cached side             (bid/ask map select)
+    std::uint8_t  _pad[11];    // 11 -> 32 B; alignas(32) => exactly one cache line, never split
 };
+static_assert(sizeof(SlabEntry)  == 32, "SlabEntry must be 32 bytes (single-cache-line lookup)");
+static_assert(alignof(SlabEntry) == 32, "SlabEntry must be 32-byte aligned (no cache-line split)");
+static_assert(std::is_trivially_copyable_v<SlabEntry>);
 
 template <class NodeT,
           class BidMapT = RBPriceIndex<std::greater<PriceTick>>,
@@ -93,23 +106,20 @@ public:
     // Lazily cancel by id. Returns true if a live order was removed.
     bool cancel(OrderId id) noexcept {
         if (id >= locators_.size()) return false;
-        const SlabEntry loc = locators_[id];
+        const SlabEntry loc = locators_[id];   // ONE cache-line load: node/slot + price/qty/side
         if (loc.node == INVALID_INDEX) return false;                     // not live
         if (loc.node >= nodes_.size()) { clear_slot(id); return false; } // bounds (defensive)
 
-        Order* ord = nodes_[loc.node].at(loc.slot);
-        if (ord == nullptr) { clear_slot(id); return false; }            // stale
-
-        const Qty       rem   = ord->remaining;
-        const PriceTick price = ord->price;   // read back from the order (no dup in slab)
-        const Side      side  = ord->side;
-
-        nodes_[loc.node].remove(loc.slot);    // clear occupancy bit + FIFO unlink (O(1))
+        // Free the physical slot (occupancy bit + FIFO unlink, O(1)). We NO LONGER load the
+        // node's cold slot payload for price/qty/side -- they're cached in `loc`, so cancel is
+        // one slab line + the node's metadata line, not a chase into the 2.5 KB slots array.
+        const bool removed = nodes_[loc.node].remove(loc.slot);
         clear_slot(id);
+        if (!removed) return false;            // slot already free (stale) -> don't touch the level
 
         try {
-            if (side == Side::BUY) update_after_cancel(bids_, price, rem);
-            else                   update_after_cancel(asks_, price, rem);
+            if (loc.side == Side::BUY) update_after_cancel(bids_, loc.price, loc.remaining);
+            else                       update_after_cancel(asks_, loc.price, loc.remaining);
         } catch (...) { /* map find/erase here don't allocate; defensive only */ }
         return true;
     }
@@ -179,6 +189,12 @@ private:
             --live_count_;
         }
     }
+    // Matcher calls this when a resting maker is PARTIALLY filled: its node-slot remaining
+    // dropped but it stays on the book, so the cached slab remaining must track it (else a
+    // later cancel would decrement the level by a stale, too-large quantity).
+    void note_partial_fill(OrderId id, Qty remaining) noexcept {
+        if (id < locators_.size()) locators_[id].remaining = remaining;
+    }
 
     // ---- node pool (freelist) ----
     std::uint32_t alloc_node() noexcept {
@@ -203,7 +219,7 @@ private:
         if (slot == INVALID_INDEX) return false;         // defensive (space was ensured)
         lvl->total_qty   += o.remaining;
         lvl->order_count += 1;
-        locators_[o.id] = SlabEntry{node_idx, slot};     // O(1) slab write
+        locators_[o.id] = SlabEntry{node_idx, slot, o.price, o.remaining, o.side, {}};  // cache cancel-hot fields
         ++live_count_;
         return true;
     }

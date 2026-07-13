@@ -160,8 +160,12 @@ private:
                 book_.erase_id(maker.id);
                 pn->remove(slot);
                 if (lvl.order_count) --lvl.order_count;
+            } else {
+                // maker partially filled => stays resting; keep the cached slab remaining in
+                // sync so a later cancel decrements the level by the correct quantity.
+                book_.note_partial_fill(maker.id, maker.remaining);
             }
-            // else: maker partially filled => incoming is now exhausted => loop exits
+            // (a partial fill also means the incoming order is now exhausted => loop exits)
         }
     }
 
