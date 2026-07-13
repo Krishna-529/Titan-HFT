@@ -5,6 +5,10 @@ Node (PIN)** limit order book, later to be wrapped in a hand-rolled **LMAX Disru
 pipeline. Primary directive: **zero-crash** (noexcept hot path, strict bounds checks,
 safe init, zero dynamic allocation in the matching loop).
 
+## Architecture
+
+![Titan HFT "Flash One" architecture: UI/Sim → Gateway (TCP + kernel bypass) → Ingress Queue (LMAX Disruptor) → Matching Engine (PIN) + Sequencer & Journaler → Egress Queue (LMAX Disruptor) → Publish Data / Trade Reporter, with UDP/TCP feedback to the UI and journal-based power-failure recovery](docs/architecture.png)
+
 ## Status — Foundation phase (LOB data structures only)
 
 Implemented (`include/titan/`):

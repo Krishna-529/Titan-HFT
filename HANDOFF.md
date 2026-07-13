@@ -15,20 +15,19 @@
   (the "Flash One" architecture), rebuilt from a Java v0.
 - **Where:** WSL2 Ubuntu, repo at `~/projects/titan-hft-v1`. Edit from Windows via the
   UNC path `\\wsl.localhost\Ubuntu\home\krishna\projects\titan-hft-v1\...`.
-- **HEAD:** `v1.3.1` (`f13fddd`) — the **Journaler** (mmap WAL + ABI safety harness) is
-  committed. `v1.3.0` (`2439f8e`) sealed the ThreadSanitizer-proven lock-free core.
-- **Uncommitted right now (→ v1.3.2):** the **real Sequencer + WAL wiring + recovery/replay**:
-  `include/titan/pipeline/sequencer.hpp` (new), `tests/sequencer_tests.cpp` (new, 5 tests),
-  `include/titan/io/journaler.hpp` (added `sync_dirty`/`flush_async`/`flush_sync`),
-  `bench/pipeline_bench.cpp` (journaling-tax measurement), `build.sh` edits. **All 34 tests
-  pass under ASan/UBSan; TSan still 3/0.** Not committed.
-- **Next action:** commit v1.3.2. Then: real server `main()` (a running process, not a bench),
-  gateway/networking, MPSC ingress. Also worth addressing: the arena-exhaustion crash gap in
-  the matcher (see §9).
-- **Status of the whole diagram:** the matching core, the lock-free rings, the WAL, **and now
-  the Sequencer (seq-stamp → write-ahead journal → publish) + WAL recovery/replay** are done.
-  The rest of the I/O half (gateway, kernel-bypass networking, real publishers, UI, MPSC) is
-  mock/absent.
+- **HEAD:** `v1.3.2` (`827f3a0`) — the **real Sequencer + WAL wiring + recovery/replay** is
+  committed. (`v1.3.1` = Journaler; `v1.3.0` sealed the TSan-proven lock-free core.)
+- **Uncommitted right now (→ v1.3.3):** **matcher zero-crash exhaustion hardening** —
+  `include/titan/book/matcher.hpp` (submit `try/catch(bad_alloc)` + `TRADE_STATUS_REJECTED`
+  emission on a failed residual rest), `trade_event.hpp` (+`status` byte, still 32-B POD),
+  `order_book.hpp` (+optional `level_capacity`), `tests/matcher_tests.cpp` (+2 rejection tests).
+  **All 36 tests pass under ASan/UBSan; TSan still 3/0.** Not committed.
+- **Next action:** commit v1.3.3. Then: real server `main()` (a running process, not a bench),
+  gateway/networking, MPSC ingress.
+- **Status of the whole diagram:** the matching core (now **zero-crash under exhaustion**), the
+  lock-free rings, the WAL, **and the Sequencer (seq-stamp → write-ahead journal → publish) + WAL
+  recovery/replay** are done. The rest of the I/O half (gateway, kernel-bypass networking, real
+  publishers, UI, MPSC) is mock/absent.
 
 ---
 
@@ -139,16 +138,15 @@ we iterated:
 
 ## 3. Current state (exact)
 
-**HEAD = `v1.3.1` (`f13fddd`).** Working tree has the Sequencer + WAL wiring + recovery
-uncommitted (→ v1.3.2):
+**HEAD = `v1.3.2` (`827f3a0`).** Working tree (→ v1.3.3): matcher zero-crash exhaustion
+hardening:
 ```
- M build.sh                              # + tests/sequencer_tests.cpp
- M bench/pipeline_bench.cpp              # + journaling-tax measurement (section D)
- M include/titan/io/journaler.hpp        # + sync_dirty / flush_async / flush_sync
-?? include/titan/pipeline/sequencer.hpp  # NEW: Sequencer + replay()
-?? tests/sequencer_tests.cpp             # NEW: 5 tests (wiring + recovery)
+ M include/titan/book/matcher.hpp        # submit try/catch(bad_alloc) + REJECTED emission
+ M include/titan/book/trade_event.hpp    # + status byte (FILL/REJECTED), still 32-B POD
+ M include/titan/book/order_book.hpp     # + optional level_capacity param (default unchanged)
+ M tests/matcher_tests.cpp               # + 2 graceful-rejection tests
 ```
-Test counts: **ASan/UBSan suite = 34 tests / 67,430 checks** (`build.sh`). **TSan gate = 3
+Test counts: **ASan/UBSan suite = 36 tests / 67,465 checks** (`build.sh`). **TSan gate = 3
 ring tests, zero data races** (`tsan.sh`). Both green.
 
 Also uncommitted/updated this session: `PROGRESS.md` and this `HANDOFF.md`.
@@ -170,7 +168,7 @@ Also uncommitted/updated this session: `PROGRESS.md` and this `HANDOFF.md`.
 | **Sequencer: seq → write-ahead journal → publish** | log-before-effect ⇒ WAL is a faithful replayable history; seq is the single source of arrival order |
 | **Deferred durability cadence** (MS_ASYNC/batch, MS_SYNC every K=64) | append stays syscall-free; bounds loss window without a per-order syscall (append ~free, sync is the cost — §6) |
 | **Recovery via `seq==base+i` invariant** | torn-tail boundary independent of id scheme / `count`; robust to zeroed un-flushed tail |
-| **Zero-crash discipline** | `noexcept` hot paths, bounds checks, ASan/UBSan on core, TSan on concurrency (gap: matcher consume path on arena exhaustion — §9) |
+| **Zero-crash discipline** | `noexcept` hot paths, bounds checks, ASan/UBSan on core, TSan on concurrency; **submit degrades to a REJECTED event under pool/arena exhaustion** (never terminates); construction is fail-fast — §9 |
 
 **Memory-ordering model (the ring's one happens-before edge):** producer writes the slot →
 `cursor.store(release)`; consumer `cursor.load(acquire)` → reads the slot. Slot reuse is the
@@ -246,7 +244,7 @@ include/titan/
   pipeline/spsc_ring.hpp           generic SpscRing<T> (the lock-free core)
   pipeline/ingress_ring.hpp        IngressRing = SpscRing<Order>  (alias)
   pipeline/egress_ring.hpp         EgressRing  = SpscRing<TradeEvent> (alias)
-  pipeline/sequencer.hpp           [→v1.3.2] Sequencer (seq→journal→publish) + replay() recovery
+  pipeline/sequencer.hpp           Sequencer (seq→journal→publish) + replay() recovery [v1.3.2]
   io/journaler.hpp                 mmap WAL + FileHeader safety harness (+ sync_dirty/flush_* in v1.3.2)
 tests/
   ut.hpp                           tiny test harness (TEST_CASE/CHECK/REQUIRE)
@@ -255,7 +253,7 @@ tests/
   rb_tree_tests.cpp                RB-tree invariant tests (no main)
   spsc_ring_tests.cpp              TSan ring tests (own main; built by tsan.sh)
   journaler_tests.cpp              WAL round-trip + safety-harness tests (no main)
-  sequencer_tests.cpp              [→v1.3.2] Sequencer wiring + recovery/replay tests (no main)
+  sequencer_tests.cpp              Sequencer wiring + recovery/replay tests (no main) [v1.3.2]
 bench/
   matcher_bench.cpp                single-thread matcher throughput
   pipeline_bench.cpp               A inline / B 2-thread / C 3-thread + checksum
@@ -316,12 +314,27 @@ cancels/modifies ever enter the ingress path, the WAL must become a tagged comma
 discriminator + union/variant payload) — replaying orders alone would silently diverge. Noted in
 `sequencer.hpp`.
 
-**FINDING — pre-existing crash gap in the matcher (NOT introduced here):** under genuine **arena
-exhaustion**, a `bad_alloc` escapes the matcher's `noexcept` consume path (an *unwrapped*
-allocation, likely `opp.erase(it)`/level-map churn in `cross()` — `add()`'s residual-rest path is
-already wrapped) → `std::terminate`. Surfaced when a test arena was undersized (fixed by sizing to
-32 MB bench parity). Violates the zero-crash mandate on exhaustion; worth wrapping the consume-path
-map ops (or pre-flighting capacity) so exhaustion degrades gracefully like `add()` does.
+**RESOLVED (→ v1.3.3) — zero-crash under resource exhaustion.** The earlier "bad_alloc escapes
+`cross()`" hypothesis was **wrong** and was empirically corrected before fixing:
+- `cross()`/`sweep_level()` **never allocate** — `RBPriceIndex::erase()` is `noexcept` and
+  allocation-free (`release()` pushes to a heap freelist pre-`reserve`d to capacity). The only
+  `bad_alloc` source is `RBPriceIndex::alloc()` (a new price level), reachable **only via
+  `book_.add()`**, which was already wrapped. A probe confirmed: heavy crossing → no throw.
+- The actual unhandled throw was **`OrderBook` construction**: the two RB level pools default to
+  65,536 nodes (~4 MB each), so a too-small arena throws `bad_alloc` from the ctor. This is now
+  **by-design fail-fast** (documented in `order_book.hpp`): a book that can't allocate its levels
+  fails loud at startup, before any order — not a hot-path violation.
+- **Hot-path hardening shipped:** `Matcher::submit` now (a) turns a failed residual rest
+  (`add()==false`, node/level pool full) into a **graceful `TRADE_STATUS_REJECTED` event**
+  (`quantity==0`, `maker_id==0`) published to the sink, and (b) wraps its whole body in
+  `try/catch(std::bad_alloc)` — defence-in-depth that keeps the `noexcept` contract total should
+  any future consume-path allocation ever throw (today it can't; `add()` self-catches). New
+  `MatchResult.rejected` flag; `TradeEvent` gained a `status` byte (still 32-B POD).
+- **Tests:** `matcher_rejects_gracefully_on_level_pool_exhaustion` (drives the real `alloc()`
+  `bad_alloc`) and `..._on_node_pool_exhaustion` (the `alloc_node()→false` path) — each asserts the
+  process survives, a REJECTED event is emitted, and the matcher still fills the next order.
+  `OrderBook` gained an optional `level_capacity` param (default unchanged) so the pools can be
+  constrained for the test.
 
 **Durability caveat still true:** between `MS_SYNC` checkpoints a hard crash loses ≤ the loss
 window's un-flushed appends (they're page-cache-only). The recovery invariant makes this *safe*
@@ -350,7 +363,8 @@ window's un-flushed appends (they're page-cache-only). The recovery invariant ma
 | v1.2.5 | d6f3219 | Egress `publish_batch` + matcher local buffer (3rd-core +60% → +7%) |
 | **v1.3.0** | **2439f8e** | **Component Complete: Lock-Free Core Pipeline (all 4 ring methods TSan-proven)** |
 | v1.3.1 | f13fddd | Journaler: mmap WAL + ABI safety harness + tests |
-| (pending) v1.3.2 | — | Real Sequencer (seq→write-ahead journal→publish) + WAL recovery/replay + durability cadence + journaling-tax bench |
+| v1.3.2 | 827f3a0 | Real Sequencer (seq→write-ahead journal→publish) + WAL recovery/replay + durability cadence + journaling-tax bench |
+| (pending) v1.3.3 | — | Matcher zero-crash under pool/arena exhaustion: `submit` → REJECTED event; `TradeEvent.status`; construction fail-fast |
 
 ---
 
