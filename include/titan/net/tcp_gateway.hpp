@@ -13,11 +13,12 @@
 #define _GNU_SOURCE 1
 #endif
 
-// Zero-copy read: recv() writes STRAIGHT into the destination Order's own memory (no
-// separate staging std::vector<byte>/char buffer). A TCP struct that arrives split
-// across segments is reassembled by accumulating into that same in-place Order -- there
-// is no extra copy through an intermediate buffer, just partial recv()s into successive
-// offsets of the final destination.
+// Batched read: each recv() pulls up to READ_BUF bytes -- MANY Orders -- in ONE syscall,
+// then we parse complete Order structs straight out of that in-memory chunk. This replaces
+// the earlier one-recv()-per-Order design (a syscall per message; ~10k syscalls for 10k
+// orders) with ~READ_BUF/sizeof(Order) Orders per syscall, so the read path is now bound
+// only by socket-buffer refills, not by message count. A single Order split across recv()
+// boundaries is carried in Conn::pending until the next chunk completes it (stream reassembly).
 //
 // Wire format: raw host-native Order bytes (a memcpy across the socket). This assumes
 // the same machine/architecture as the engine on both ends -- NOT a portable encoding.
@@ -43,9 +44,11 @@
 // mock) works, mirroring the Matcher's sink-templating pattern elsewhere in this repo.
 //
 #include <arpa/inet.h>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdexcept>
@@ -140,13 +143,15 @@ public:
     }
 
 private:
-    static constexpr int MAX_EVENTS = 64;
+    static constexpr int         MAX_EVENTS = 64;
+    static constexpr std::size_t READ_BUF   = 4096;   // per-recv() batch (~102 Orders/syscall)
 
-    // Per-connection reassembly state. `pending` IS the recv() destination -- see the
-    // zero-copy note at the top of the file.
+    // Per-connection reassembly state. `pending` holds only a PARTIAL Order carried between
+    // recv() chunks (a struct split across TCP/recv boundaries); `filled` is how many of its
+    // leading bytes have arrived so far, in [0, sizeof(Order)).
     struct Conn {
         Order       pending{};
-        std::size_t filled = 0;   // bytes of `pending` received so far, in [0, sizeof(Order)]
+        std::size_t filled = 0;
     };
 
     void arm(int fd, std::uint32_t events) {
@@ -189,8 +194,9 @@ private:
         conns_.erase(fd);
     }
 
-    // Connection fd is edge-triggered: drain until EAGAIN, reassembling any Order split
-    // across TCP segments directly into Conn::pending (no staging buffer -- see top note).
+    // Connection fd is edge-triggered: drain until EAGAIN. Each recv() pulls a whole BATCH
+    // of bytes (up to READ_BUF) in ONE syscall; parse_chunk() then walks that in-memory
+    // buffer publishing every complete Order and carrying any trailing fragment forward.
     void handle_conn(int fd, std::uint32_t revents) noexcept {
         if (revents & (EPOLLERR | EPOLLHUP)) { close_conn(fd); return; }
 
@@ -198,23 +204,51 @@ private:
         if (it == conns_.end()) return;   // defensive: event for an already-closed fd
         Conn& c = it->second;
 
+        std::array<std::uint8_t, READ_BUF> buf;
         for (;;) {
-            std::byte* dst = reinterpret_cast<std::byte*>(&c.pending) + c.filled;
-            const std::size_t need = sizeof(Order) - c.filled;
-            const ssize_t n = ::recv(fd, dst, need, 0);
-
+            const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
             if (n > 0) {
-                c.filled += static_cast<std::size_t>(n);
-                if (c.filled == sizeof(Order)) {
-                    seq_.publish(c.pending);          // stamp seq -> write-ahead journal -> ingress
-                    c.filled = 0;
-                }
+                parse_chunk(c, buf.data(), static_cast<std::size_t>(n));
                 continue;                              // edge-triggered: keep draining
             }
             if (n == 0) { close_conn(fd); return; }     // peer sent FIN (graceful close)
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;   // drained for now
             if (errno == EINTR) continue;
             close_conn(fd); return;                     // real error -> drop the connection
+        }
+    }
+
+    // Parse every complete Order out of one freshly-recv'd byte chunk, publishing each to the
+    // Sequencer (stamp seq -> write-ahead journal -> ingress). Finishes a carried fragment
+    // first, then walks whole Orders, then stashes any trailing partial Order in Conn::pending.
+    void parse_chunk(Conn& c, const std::uint8_t* data, std::size_t len) noexcept {
+        std::size_t off = 0;
+
+        // (1) complete a partial Order carried from the previous recv().
+        if (c.filled > 0) {
+            const std::size_t need = sizeof(Order) - c.filled;
+            const std::size_t take = (len < need) ? len : need;
+            std::memcpy(reinterpret_cast<std::uint8_t*>(&c.pending) + c.filled, data, take);
+            c.filled += take;
+            off      += take;
+            if (c.filled < sizeof(Order)) return;      // still incomplete -> await more bytes
+            seq_.publish(c.pending);
+            c.filled = 0;
+        }
+
+        // (2) publish every whole Order the chunk contains.
+        while (len - off >= sizeof(Order)) {
+            Order o;
+            std::memcpy(&o, data + off, sizeof(Order));   // copy out of the (unaligned) byte buffer
+            seq_.publish(o);
+            off += sizeof(Order);
+        }
+
+        // (3) carry the trailing partial-Order fragment (if any) into pending for next time.
+        const std::size_t rem = len - off;
+        if (rem > 0) {
+            std::memcpy(&c.pending, data + off, rem);
+            c.filled = rem;
         }
     }
 

@@ -5,6 +5,10 @@
 a.out
 titan_tests
 titan_bench
+titan-server
+
+# Write-ahead log files (titan-server writes titan.wal to cwd)
+*.wal
 
 # Editor / OS
 .vscode/
