@@ -53,6 +53,7 @@ def make_socket(group, port, iface):
 def run_trades(rx, args):
     datagrams = records = malformed = total_bytes = 0
     samples = []
+    first_ns = hit_ns = last_ns = 0
     start = time.time()
     while True:
         if time.time() - start > args.deadline:
@@ -61,6 +62,9 @@ def run_trades(rx, args):
             data, _ = rx.recvfrom(65535)
         except socket.timeout:
             break
+        last_ns = time.monotonic_ns()               # wire-to-wire clock (system-wide CLOCK_MONOTONIC)
+        if first_ns == 0:
+            first_ns = last_ns
         datagrams += 1
         total_bytes += len(data)
         if len(data) == 0 or len(data) % TRADE_SZ != 0:
@@ -73,10 +77,16 @@ def run_trades(rx, args):
                 break
             samples.append(struct.unpack_from(TRADE_FMT, data, k * TRADE_SZ))
         if args.expect and records >= args.expect:
+            hit_ns = last_ns
             break
 
     print("[trades] RESULT datagrams=%d records=%d bytes=%d malformed=%d"
           % (datagrams, records, total_bytes, malformed), flush=True)
+    # STAMP line (nanoseconds, CLOCK_MONOTONIC): the benchmark script diffs hit_ns/last_ns vs the
+    # blaster's T0_NS for wire-to-wire latency. reached=1 iff the --expect count was received.
+    print("[trades] STAMP first_ns=%d hit_ns=%d last_ns=%d records=%d expect=%d reached=%d"
+          % (first_ns, hit_ns, last_ns, records, args.expect, 1 if (args.expect and records >= args.expect) else 0),
+          flush=True)
     for s in samples:
         print("[trades] TradeEvent taker=%d maker=%d price=%d feed_seq=%d qty=%d side=%d status=%s"
               % (s[0], s[1], s[2], s[3], s[4], s[5], STATUS.get(s[6], s[6])), flush=True)

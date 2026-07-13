@@ -8,7 +8,9 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CXX="${CXX:-g++}"
-FLAGS=(-std=c++20 -O3 -march=native -DNDEBUG -D_GNU_SOURCE -Iinclude -pthread)
+# RELEASE + profiling hooks: -g -fno-omit-frame-pointer keep frame pointers & symbols so the
+# binary is profileable under `perf` (negligible runtime cost on x86-64) without leaving RELEASE.
+FLAGS=(-std=c++20 -O3 -march=native -DNDEBUG -g -fno-omit-frame-pointer -D_GNU_SOURCE -Iinclude -pthread)
 
 mkdir -p build
 {

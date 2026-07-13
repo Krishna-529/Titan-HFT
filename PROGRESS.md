@@ -33,6 +33,17 @@ components land.
 | **2-thread** (Sequencer → Ingress → Matcher) | ~43–67 | **~15–23 M/s** |
 | **3-thread** (+ Egress → Publisher, batch-publish) | ~72 | **~14–22 M/s** |
 
+**Wire-to-wire baseline** (v1.4.8, `bench_end_to_end.sh`, 1M orders, 5-thread `titan-server`, loopback):
+| Metric | Result (3 runs) |
+|---|---|
+| Ingest (1st TCP byte → all orders accepted) | 83–101 ms → **~10–12 M orders/s** |
+| **Wire-to-wire** (1st byte → external listener gets the 1,000,000th trade) | 233–310 ms → **~3.2–4.3 M orders/s** |
+| UDP delivery | **0 loss** (1,000,000/1,000,000), 100 L2 snapshots |
+
+Wire-to-wire spans the full TCP-in → match → UDP-out → python-receive path; its tail is
+influenced by the listener draining ~28k datagrams, so ingest (~11 M/s) bounds the engine and
+wire-to-wire (~3–4 M/s) is the externally-observed rate. `perf` attribution is the next phase.
+
 Absolute ns drift with WSL2 thermal state; the reliable metric is the **within-run**
 ratio (+ identical trade checksums for correctness). Ring overheads, thermal-invariant:
 - Ingress **batch-drain + prefetch** → 2-thread overhead **+107% → −9%** (faster than inline):
@@ -81,7 +92,8 @@ ratio (+ identical trade checksums for correctness). Ring overheads, thermal-inv
 | v1.4.4 | 2026-07-13 | UDP multicast Publisher (`net/udp_publisher.hpp`): raw-binary TradeEvent fan-out, non-blocking, MTU-safe. Publisher(T4) rewired egress → multicast. Verified end-to-end: external listener decoded 122,223 TradeEvents, zero loss |
 | v1.4.5 | 2026-07-13 | Permanent multicast harness (`tests/mc_listener.py` + `tests/multicast_test.sh`): self-contained build + blast + external-listener verify (graceful exit on count/idle) |
 | v1.4.6 | 2026-07-13 | L2 snapshot primitive + lock-free triple-buffer pool (`book/snapshot.hpp`, seq_cst `in_use` reclamation); TSan gate 1W/1R × 1M generations, 0 torn / 0 races |
-| *(uncommitted)* v1.4.7 | 2026-07-14 | Wire snapshot into server: `feed_seq` on TradeEvent (32→40 B), `OrderBook::serialize_l2` (RB walk → L2), Matcher K=10k cadence, T5 snapshot thread + 2nd multicast channel (:30002). Dual-feed harness verifies both; all TSan/ASan gates green |
+| v1.4.7 | 2026-07-14 | Wire snapshot into server: `feed_seq` on TradeEvent (32→40 B), `OrderBook::serialize_l2` (RB walk → L2), Matcher K=10k cadence, T5 snapshot thread + 2nd multicast channel (:30002). Dual-feed harness verifies both; all TSan/ASan gates green |
+| *(uncommitted)* v1.4.8 | 2026-07-14 | End-to-end benchmark: `bench_end_to_end.sh` + `tests/tcp_blaster.cpp` (1M-order wire-to-wire); listener CLOCK_MONOTONIC stamps. Baseline: ingest ~11 M/s, wire-to-wire ~3–4 M/s, 0 UDP loss. Server built with `-g -fno-omit-frame-pointer` for `perf` |
 
 ## Planned build order
 1. ~~Wire the egress ring into the matcher~~ ✅ v1.2.4 + `publish_batch`
