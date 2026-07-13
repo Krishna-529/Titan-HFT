@@ -112,6 +112,31 @@ public:
 
     void sync() noexcept { if (map_ && map_ != MAP_FAILED) ::msync(map_, map_bytes_, MS_SYNC); }
 
+    // Incremental flush: msync ONLY the pages dirtied since the last flush -- avoids
+    // re-scanning the whole (mostly-clean) mapping on every checkpoint. Order records
+    // are page-unaligned (40B), so the dirty byte range is aligned out to page bounds.
+    //   MS_ASYNC -> schedules writeback, returns immediately (~free, non-blocking).
+    //   MS_SYNC  -> durability checkpoint: blocks until the pages are on disk, and also
+    //               flushes the header page so the `count` write-cursor is durable too.
+    void sync_dirty(int flags) noexcept {
+        if (!map_ || map_ == MAP_FAILED) return;
+        const std::uint64_t cnt = header_->count;
+        if (cnt == synced_count_ && flags == MS_ASYNC) return;             // nothing new to schedule
+        const std::size_t pg = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        std::size_t begin = sizeof(FileHeader) + static_cast<std::size_t>(synced_count_) * sizeof(Order);
+        std::size_t end   = sizeof(FileHeader) + static_cast<std::size_t>(cnt)           * sizeof(Order);
+        begin -= begin % pg;                                                // align down to a page
+        end    = ((end + pg - 1) / pg) * pg;                               // align up to a page
+        if (end > map_bytes_) end = map_bytes_;
+        if (end > begin) ::msync(reinterpret_cast<char*>(map_) + begin, end - begin, flags);
+        if (flags == MS_SYNC) ::msync(map_, pg, MS_SYNC);                  // header page -> durable count
+        synced_count_ = cnt;
+    }
+
+    // Cadence hooks the Sequencer calls at batch boundaries (keeps POSIX flags out of it).
+    void flush_async() noexcept { sync_dirty(MS_ASYNC); }                  // per-batch writeback nudge
+    void flush_sync()  noexcept { sync_dirty(MS_SYNC);  }                  // periodic durability checkpoint
+
     // Startup safety harness: aggressively reject a WAL whose binary layout isn't ours.
     void validate() const {
         if (header_->magic != WAL_MAGIC)
@@ -139,6 +164,7 @@ private:
     FileHeader*   header_    = nullptr;
     Order*        data_      = nullptr;
     std::uint64_t capacity_  = 0;
+    std::uint64_t synced_count_ = 0;   // records already handed to sync_dirty (flush cursor)
 };
 
 } // namespace titan::io

@@ -12,6 +12,8 @@
 //
 // Build (RELEASE, -pthread, ASan OFF): see pipeline.sh
 //
+#include "titan/pipeline/sequencer.hpp"   // FIRST: pulls journaler.hpp -> _DEFAULT_SOURCE (pipeline.sh omits -D)
+
 #include "titan/book/matcher.hpp"
 #include "titan/book/order_book.hpp"
 #include "titan/book/trade_event.hpp"
@@ -24,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <random>
 #include <thread>
 #include <vector>
@@ -206,6 +209,75 @@ double run_pipeline3(const std::vector<Order>& orders) {
     return std::chrono::duration<double, std::nano>(t1 - t0).count() / static_cast<double>(N);
 }
 
+// ---------------- Journaling tax: sequencer publish-loop cost, WAL on vs off ----------------
+// Same 2-thread topology (the matcher drains so the ingress ring never deadlocks), but the
+// Sequencer times ONLY its own publish loop. The Journaler is constructed BEFORE the timer and
+// its dtor msync runs AFTER it, so the measured delta is purely the per-order hot-path tax
+// (write-ahead memcpy + doubled write bandwidth + first-touch faults [+ flush cadence]).
+//   NONE        : no WAL (baseline, same publish as run_pipeline2's sequencer)
+//   APPEND      : WAL append only, NO msync -> isolates the raw append cost
+//   APPEND_SYNC : WAL append + MS_ASYNC every 1024 + MS_SYNC every 64th -> adds the durability cost
+enum class Jmode { NONE, APPEND, APPEND_SYNC };
+const char* WAL_PATH = "build/titan_pipeline.wal";           // ext4-backed (real msync writeback)
+
+double run_seq_tax(const std::vector<Order>& orders, Jmode mode) {
+    IngressRing<RING_IN>       ingress;
+    std::atomic<int>           ready{0};
+    std::atomic<bool>          go{false};
+    std::atomic<double>        seq_ns{0.0};
+
+    std::thread matcher_thread([&] {
+        Arena arena(ARENA_BYTES);
+        OrderBook book(arena, MAX_NODES, ID_CAP);
+        Matcher matcher(book);
+        ChecksumSink sink;
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) { }
+        std::uint64_t c = 0;
+        while (c < N) c += ingress.consume_batch([&](const Order& in) { matcher.submit(in, sink); });
+        g_sink += sink.chk;
+    });
+
+    std::thread sequencer([&] {
+        std::optional<titan::io::Journaler> wal;
+        if (mode != Jmode::NONE) wal.emplace(WAL_PATH, N + 64);   // open+fallocate+mmap OUTSIDE the timer
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) { }
+
+        const auto s0 = std::chrono::high_resolution_clock::now();
+        if (mode == Jmode::NONE) {
+            for (std::uint64_t i = 0; i < N; ++i) {
+                Order o = orders[i]; o.seq = i;
+                while (!ingress.try_publish(o)) { }
+            }
+        } else {
+            const std::uint32_t fi = (mode == Jmode::APPEND_SYNC) ? 1024u : (N + 1);  // N+1 => never flush
+            const std::uint32_t se = (mode == Jmode::APPEND_SYNC) ? 64u   : 0u;
+            Sequencer<IngressRing<RING_IN>> seq(ingress, *wal, fi, se);
+            for (std::uint64_t i = 0; i < N; ++i) seq.publish(orders[i]);
+        }
+        const auto s1 = std::chrono::high_resolution_clock::now();
+        seq_ns.store(std::chrono::duration<double, std::nano>(s1 - s0).count() / static_cast<double>(N));
+        // wal dtor (msync + munmap) runs here, AFTER s1 -> excluded from the measured tax.
+    });
+
+    while (ready.load(std::memory_order_acquire) != 2) { }
+    go.store(true, std::memory_order_release);
+    sequencer.join();
+    matcher_thread.join();
+    return seq_ns.load();
+}
+
+double best_seq_tax(const std::vector<Order>& o, Jmode mode, const char* tag) {
+    double best = 1e18;
+    for (int r = 0; r < REPS; ++r) {
+        const double ns = run_seq_tax(o, mode);
+        best = std::min(best, ns);
+        std::printf("  %-16s rep %d:  %6.1f ns/order\n", tag, r, ns);
+    }
+    return best;
+}
+
 double best_of(double (*fn)(const std::vector<Order>&), const std::vector<Order>& o, const char* tag) {
     double best = 1e18;
     for (int r = 0; r < REPS; ++r) {
@@ -239,5 +311,17 @@ int main() {
                 (unsigned long long)g_chk_inline, (unsigned long long)g_chk_2t, (unsigned long long)g_chk_3t,
                 (g_chk_inline == g_chk_2t && g_chk_2t == g_chk_3t) ? "MATCH" : "DIVERGED!");
     std::printf("  sink=%llu\n", (unsigned long long)g_sink);
+
+    // ---- Journaling tax (sequencer publish-loop cost; thermal-invariant within this run) ----
+    std::printf("\n(D) journaling tax -- Sequencer publish-loop cost (WAL off vs on):\n");
+    const double j_none = best_seq_tax(orders, Jmode::NONE,        "no-wal");
+    const double j_app  = best_seq_tax(orders, Jmode::APPEND,      "wal-append");
+    const double j_sync = best_seq_tax(orders, Jmode::APPEND_SYNC, "wal-append+sync");
+    std::printf("\n=========================================================\n");
+    std::printf("  no-wal          : %6.1f ns/order\n", j_none);
+    std::printf("  wal-append      : %6.1f ns/order   (append tax   %+.1f ns, %+.1f%%)\n",
+                j_app,  j_app  - j_none, 100.0 * (j_app  - j_none) / j_none);
+    std::printf("  wal-append+sync : %6.1f ns/order   (+durability  %+.1f ns, %+.1f%% vs no-wal)\n",
+                j_sync, j_sync - j_none, 100.0 * (j_sync - j_none) / j_none);
     return 0;
 }

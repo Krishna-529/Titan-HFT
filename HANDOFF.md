@@ -15,17 +15,20 @@
   (the "Flash One" architecture), rebuilt from a Java v0.
 - **Where:** WSL2 Ubuntu, repo at `~/projects/titan-hft-v1`. Edit from Windows via the
   UNC path `\\wsl.localhost\Ubuntu\home\krishna\projects\titan-hft-v1\...`.
-- **HEAD:** `v1.3.0` (`2439f8e`) — *"Component Complete: Lock-Free Core Pipeline"*. The
-  entire inbound/outbound lock-free core is built, benchmarked, and **ThreadSanitizer-proven**.
-- **Uncommitted right now (→ v1.3.1):** the **Journaler** (mmap Write-Ahead Log):
-  `include/titan/io/journaler.hpp`, `tests/journaler_tests.cpp`, and `build.sh` edits.
-  It's implemented and **all 29 tests pass under ASan/UBSan**, just not committed or wired in.
-- **Next action:** commit v1.3.1, then **wire the Journaler into the Sequencer + add a
-  recovery/replay path** (closes the power-failure box). After that: real server `main()`,
-  gateway/networking, MPSC ingress.
-- **Status of the whole diagram:** the matching core + the lock-free rings are done; the
-  WAL data structure is done. The rest of the I/O half (real sequencer, journaler *wiring*,
-  gateway, kernel-bypass networking, publishers, UI, MPSC) is mock/absent.
+- **HEAD:** `v1.3.1` (`f13fddd`) — the **Journaler** (mmap WAL + ABI safety harness) is
+  committed. `v1.3.0` (`2439f8e`) sealed the ThreadSanitizer-proven lock-free core.
+- **Uncommitted right now (→ v1.3.2):** the **real Sequencer + WAL wiring + recovery/replay**:
+  `include/titan/pipeline/sequencer.hpp` (new), `tests/sequencer_tests.cpp` (new, 5 tests),
+  `include/titan/io/journaler.hpp` (added `sync_dirty`/`flush_async`/`flush_sync`),
+  `bench/pipeline_bench.cpp` (journaling-tax measurement), `build.sh` edits. **All 34 tests
+  pass under ASan/UBSan; TSan still 3/0.** Not committed.
+- **Next action:** commit v1.3.2. Then: real server `main()` (a running process, not a bench),
+  gateway/networking, MPSC ingress. Also worth addressing: the arena-exhaustion crash gap in
+  the matcher (see §9).
+- **Status of the whole diagram:** the matching core, the lock-free rings, the WAL, **and now
+  the Sequencer (seq-stamp → write-ahead journal → publish) + WAL recovery/replay** are done.
+  The rest of the I/O half (gateway, kernel-bypass networking, real publishers, UI, MPSC) is
+  mock/absent.
 
 ---
 
@@ -136,17 +139,19 @@ we iterated:
 
 ## 3. Current state (exact)
 
-**HEAD = `v1.3.0` (`2439f8e`).** Working tree has the Journaler uncommitted:
+**HEAD = `v1.3.1` (`f13fddd`).** Working tree has the Sequencer + WAL wiring + recovery
+uncommitted (→ v1.3.2):
 ```
- M build.sh                        # + tests/journaler_tests.cpp, + -D_DEFAULT_SOURCE
-?? include/titan/io/               # journaler.hpp (new dir)
-?? tests/journaler_tests.cpp
+ M build.sh                              # + tests/sequencer_tests.cpp
+ M bench/pipeline_bench.cpp              # + journaling-tax measurement (section D)
+ M include/titan/io/journaler.hpp        # + sync_dirty / flush_async / flush_sync
+?? include/titan/pipeline/sequencer.hpp  # NEW: Sequencer + replay()
+?? tests/sequencer_tests.cpp             # NEW: 5 tests (wiring + recovery)
 ```
-Test counts: **ASan/UBSan suite = 29 tests / 67,411 checks** (`build.sh`). **TSan gate = 3
+Test counts: **ASan/UBSan suite = 34 tests / 67,430 checks** (`build.sh`). **TSan gate = 3
 ring tests, zero data races** (`tsan.sh`). Both green.
 
-Also uncommitted/updated this session: **memory files** (Claude memory) and **this
-`HANDOFF.md`**.
+Also uncommitted/updated this session: `PROGRESS.md` and this `HANDOFF.md`.
 
 ---
 
@@ -162,7 +167,10 @@ Also uncommitted/updated this session: **memory files** (Claude memory) and **th
 | **batch-drain + prefetch / batch-publish** | amortize the release-store + hide the coherence transfer → overheads went negative/near-zero |
 | **Matcher sink templated** (`try_publish`) | pipeline uses EgressRing (zero-drop), tests use a vector sink — one matching path |
 | **Journaler = mmap WAL, binary, header tripwire** | non-blocking hot-path persistence; guards raw-binary ABI drift |
-| **Zero-crash discipline** | `noexcept` hot paths, bounds checks, ASan/UBSan on core, TSan on concurrency |
+| **Sequencer: seq → write-ahead journal → publish** | log-before-effect ⇒ WAL is a faithful replayable history; seq is the single source of arrival order |
+| **Deferred durability cadence** (MS_ASYNC/batch, MS_SYNC every K=64) | append stays syscall-free; bounds loss window without a per-order syscall (append ~free, sync is the cost — §6) |
+| **Recovery via `seq==base+i` invariant** | torn-tail boundary independent of id scheme / `count`; robust to zeroed un-flushed tail |
+| **Zero-crash discipline** | `noexcept` hot paths, bounds checks, ASan/UBSan on core, TSan on concurrency (gap: matcher consume path on arena exhaustion — §9) |
 
 **Memory-ordering model (the ring's one happens-before edge):** producer writes the slot →
 `cursor.store(release)`; consumer `cursor.load(acquire)` → reads the slot. Slot reuse is the
@@ -204,6 +212,22 @@ Thermal-invariant overhead deltas (the real story):
 - Ingress batch-drain + prefetch: **+107% → −9%** (2-thread faster than inline).
 - Egress batch-publish: **+60% → +7%** (third core nearly free).
 
+**Journaling tax** (v1.3.2, `pipeline_bench` section D — sequencer publish-loop cost, WAL
+on vs off, within-run so thermal-invariant):
+
+| Sequencer publish loop | ns/order | Δ vs no-WAL |
+|---|---|---|
+| no-WAL | ~42 | — |
+| WAL **append-only** | ~44.5 | **+2.5 ns (+6%)** |
+| WAL **append + sync cadence** (flush 1024, MS_SYNC every 64) | ~116 | **+74 ns (+176%)** |
+
+Read: the write-ahead **append itself is nearly free** (+2.5 ns memcpy; still below the
+matcher's ~49 ns, so append-only journaling is *hidden* behind the matcher end-to-end). The
+**`MS_SYNC` durability cadence dominates** (+74 ns) — at ~116 ns the Sequencer would become
+the pipeline bottleneck. Durability, not logging, is the real cost; **K (sync_every) is the
+throughput⇄loss-window knob.** (WAL on WSL2 ext4; real HW would use NVMe / an async writeback
+thread.)
+
 ---
 
 ## 7. File map (tracked)
@@ -222,14 +246,16 @@ include/titan/
   pipeline/spsc_ring.hpp           generic SpscRing<T> (the lock-free core)
   pipeline/ingress_ring.hpp        IngressRing = SpscRing<Order>  (alias)
   pipeline/egress_ring.hpp         EgressRing  = SpscRing<TradeEvent> (alias)
-  io/journaler.hpp                 [UNCOMMITTED] mmap WAL + FileHeader safety harness
+  pipeline/sequencer.hpp           [→v1.3.2] Sequencer (seq→journal→publish) + replay() recovery
+  io/journaler.hpp                 mmap WAL + FileHeader safety harness (+ sync_dirty/flush_* in v1.3.2)
 tests/
   ut.hpp                           tiny test harness (TEST_CASE/CHECK/REQUIRE)
   tests.cpp                        foundation tests (has the shared main())
   matcher_tests.cpp                matcher tests (no main; VecSink)
   rb_tree_tests.cpp                RB-tree invariant tests (no main)
   spsc_ring_tests.cpp              TSan ring tests (own main; built by tsan.sh)
-  journaler_tests.cpp              [UNCOMMITTED] WAL round-trip + safety-harness tests (no main)
+  journaler_tests.cpp              WAL round-trip + safety-harness tests (no main)
+  sequencer_tests.cpp              [→v1.3.2] Sequencer wiring + recovery/replay tests (no main)
 bench/
   matcher_bench.cpp                single-thread matcher throughput
   pipeline_bench.cpp               A inline / B 2-thread / C 3-thread + checksum
@@ -264,21 +290,45 @@ Only `tests.cpp` has `main()` in the `build.sh` binary; the others register into
 
 ## 9. Open decisions & next steps
 
-**Immediate (v1.3.1):** commit the Journaler.
+**DONE this session (→ v1.3.2): persistence + recovery wired** (the diagram's
+`Sequencer & Journaler` + power-failure box):
+1. **Real `Sequencer`** (`pipeline/sequencer.hpp`): stamps a monotonic `seq`, **write-ahead
+   journals** (`append` before `try_publish` — an order is in the log in append order before
+   it can affect the book), then publishes to ingress with zero-drop backpressure. Concrete,
+   no virtuals → inlinable (A/B/C bench numbers held).
+2. **Durability cadence (decided):** append stays syscall-free; durability is deferred off the
+   per-order path. `flush_async()` = `MS_ASYNC` every `flush_interval` (default **1024**) orders
+   (schedules writeback, ~free); `flush_sync()` = `MS_SYNC` every `sync_every`-th (default
+   **K=64**) interval → durability checkpoint every 65,536 orders, also flushing the header page
+   so `count` is durable. `sync_dirty` page-aligns and msyncs only the newly-dirtied tail (not
+   the whole mapping). Loss window ≤ `flush_interval * sync_every` orders. Cost measured: §6.
+3. **Recovery/replay** (`replay(wal, matcher, sink)`): reconstructs book state by re-submitting
+   records in append order. **Torn-tail boundary via the append-order invariant**
+   `wal[i].seq == base + i` (`base = wal[0].seq`) — stops at the first violation. This is robust
+   to any id scheme (never an `id==0` sentinel) and does not trust `count` as the authoritative
+   tear marker (`count` only bounds the scan; a zeroed/un-flushed tail breaks the invariant and
+   halts replay). Empty-WAL (`count==0`) is a clean no-op; replay is idempotent. 5 tests cover
+   all of this.
 
-**Then — wire persistence + recovery (the diagram's `Sequencer & Journaler` + power-failure box):**
-1. Sequencer journals each order (`Journaler::append`) as it publishes to ingress.
-2. Recovery/replay: on startup, open the WAL, `validate()`, replay `[0..count)` through the pipeline.
+**RECORD SCOPE (conscious decision):** the WAL logs **Order records only**. Nothing but new
+orders currently traverses ingress, so an Order-only log is a complete command stream. **If
+cancels/modifies ever enter the ingress path, the WAL must become a tagged command log** (op-type
+discriminator + union/variant payload) — replaying orders alone would silently diverge. Noted in
+`sequencer.hpp`.
 
-**Durability caveat to decide when wiring recovery:** the WAL currently `msync`s only on
-graceful shutdown. Appends hit the page cache instantly (that's what keeps the hot path
-syscall-free), but a **hard crash** can lose the most-recent un-flushed appends, and the header
-`count` can momentarily lead the durably-written records. The ABI crash-safety (header tripwire)
-is proven; true crash-*consistency* wants a **periodic / per-batch `msync`/`fdatasync`** to bound
-the loss window.
+**FINDING — pre-existing crash gap in the matcher (NOT introduced here):** under genuine **arena
+exhaustion**, a `bad_alloc` escapes the matcher's `noexcept` consume path (an *unwrapped*
+allocation, likely `opp.erase(it)`/level-map churn in `cross()` — `add()`'s residual-rest path is
+already wrapped) → `std::terminate`. Surfaced when a test arena was undersized (fixed by sizing to
+32 MB bench parity). Violates the zero-crash mandate on exhaustion; worth wrapping the consume-path
+map ops (or pre-flighting capacity) so exhaustion degrades gracefully like `add()` does.
 
-**After that (the rest of the I/O half — all still mock/absent):**
-- Real **server `main()`** (a running process wiring the 3 threads, not a bench).
+**Durability caveat still true:** between `MS_SYNC` checkpoints a hard crash loses ≤ the loss
+window's un-flushed appends (they're page-cache-only). The recovery invariant makes this *safe*
+(no garbage replayed); tightening the window is the K knob (§6 shows its cost).
+
+**Next (the rest of the I/O half — still mock/absent):**
+- Real **server `main()`** (a running process wiring the 3 threads + Sequencer/WAL, not a bench).
 - **Gateway + networking** (TCP order ingress, UDP market-data publish; kernel-bypass later).
 - **MPSC ingress** (multiple gateways → one ring; CAS claim).
 - **Publishers / Trade Reporter**, then the **UI / market-data feed**.
@@ -299,7 +349,8 @@ the loss window.
 | v1.2.4 | ec784b3 | 3-thread pipeline: egress wiring, zero-drop backpressure |
 | v1.2.5 | d6f3219 | Egress `publish_batch` + matcher local buffer (3rd-core +60% → +7%) |
 | **v1.3.0** | **2439f8e** | **Component Complete: Lock-Free Core Pipeline (all 4 ring methods TSan-proven)** |
-| (pending) v1.3.1 | — | Journaler: mmap WAL + safety harness + tests |
+| v1.3.1 | f13fddd | Journaler: mmap WAL + ABI safety harness + tests |
+| (pending) v1.3.2 | — | Real Sequencer (seq→write-ahead journal→publish) + WAL recovery/replay + durability cadence + journaling-tax bench |
 
 ---
 
