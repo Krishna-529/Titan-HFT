@@ -93,7 +93,8 @@ ratio (+ identical trade checksums for correctness). Ring overheads, thermal-inv
 | v1.4.5 | 2026-07-13 | Permanent multicast harness (`tests/mc_listener.py` + `tests/multicast_test.sh`): self-contained build + blast + external-listener verify (graceful exit on count/idle) |
 | v1.4.6 | 2026-07-13 | L2 snapshot primitive + lock-free triple-buffer pool (`book/snapshot.hpp`, seq_cst `in_use` reclamation); TSan gate 1W/1R × 1M generations, 0 torn / 0 races |
 | v1.4.7 | 2026-07-14 | Wire snapshot into server: `feed_seq` on TradeEvent (32→40 B), `OrderBook::serialize_l2` (RB walk → L2), Matcher K=10k cadence, T5 snapshot thread + 2nd multicast channel (:30002). Dual-feed harness verifies both; all TSan/ASan gates green |
-| *(uncommitted)* v1.4.8 | 2026-07-14 | End-to-end benchmark: `bench_end_to_end.sh` + `tests/tcp_blaster.cpp` (1M-order wire-to-wire); listener CLOCK_MONOTONIC stamps. Baseline: ingest ~11 M/s, wire-to-wire ~3–4 M/s, 0 UDP loss. Server built with `-g -fno-omit-frame-pointer` for `perf` |
+| v1.4.8 | 2026-07-14 | End-to-end benchmark: `bench_end_to_end.sh` + `tests/tcp_blaster.cpp` (1M-order wire-to-wire); listener CLOCK_MONOTONIC stamps. Baseline: ingest ~11 M/s, wire-to-wire ~3–4 M/s, 0 UDP loss. Server built with `-g -fno-omit-frame-pointer` for `perf` |
+| *(uncommitted)* v1.4.9 | 2026-07-14 | `profile.sh` (perf preferred; gprof fallback — perf absent on this WSL2 kernel, no linux-tools/sudo). Finding: engine is **memory/pointer-chasing bound, not math bound** — fill arithmetic <3%, RB-tree traversal ~10%, PIN-node slot access + cancel-path indirection ~60% |
 
 ## Planned build order
 1. ~~Wire the egress ring into the matcher~~ ✅ v1.2.4 + `publish_batch`

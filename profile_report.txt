@@ -1,0 +1,57 @@
+Flat profile:
+
+Each sample counts as 0.01 seconds.
+  %   cumulative   self              self     total           
+ time   seconds   seconds    calls  ms/call  ms/call  name    
+ 76.37      5.98     5.98                             main
+  9.32      6.71     0.73 10500728     0.00     0.00  bool titan::OrderBookT<titan::PIN_Node, titan::RBPriceIndex<std::greater<long> >, titan::RBPriceIndex<std::less<long> > >::add_impl<titan::RBPriceIndex<std::greater<long> > >(titan::RBPriceIndex<std::greater<long> >&, titan::Order const&)
+  7.15      7.27     0.56 10508281     0.00     0.00  bool titan::OrderBookT<titan::PIN_Node, titan::RBPriceIndex<std::greater<long> >, titan::RBPriceIndex<std::less<long> > >::add_impl<titan::RBPriceIndex<std::less<long> > >(titan::RBPriceIndex<std::less<long> >&, titan::Order const&)
+  2.43      7.46     0.19  5000001     0.00     0.00  frame_dummy
+  1.40      7.57     0.11        7    15.71    18.57  titan::OrderBookT<titan::PIN_Node, titan::RBPriceIndex<std::greater<long> >, titan::RBPriceIndex<std::less<long> > >::OrderBookT(titan::Arena&, unsigned int, unsigned long, unsigned long)
+  1.28      7.67     0.10 35504468     0.00     0.00  std::mersenne_twister_engine<unsigned long, 64ul, 312ul, 156ul, 31ul, 13043109905998158313ul, 29ul, 6148914691236517205ul, 17ul, 8202884508482404352ul, 37ul, 18444473444759240704ul, 43ul, 6364136223846793005ul>::operator()()
+  1.02      7.75     0.08  2422835     0.00     0.00  std::vector<(anonymous namespace)::Op, std::allocator<(anonymous namespace)::Op> >::~vector()
+  0.64      7.80     0.05   113801     0.00     0.00  std::mersenne_twister_engine<unsigned long, 64ul, 312ul, 156ul, 31ul, 13043109905998158313ul, 29ul, 6148914691236517205ul, 17ul, 8202884508482404352ul, 37ul, 18444473444759240704ul, 43ul, 6364136223846793005ul>::_M_gen_rand()
+  0.13      7.81     0.01        7     1.43     1.43  std::vector<titan::RBPriceIndex<std::less<long> >::Node, std::pmr::polymorphic_allocator<titan::RBPriceIndex<std::less<long> >::Node> >::_M_default_append(unsigned long)
+  0.13      7.82     0.01        7     1.43     1.43  std::vector<titan::RBPriceIndex<std::greater<long> >::Node, std::pmr::polymorphic_allocator<titan::RBPriceIndex<std::greater<long> >::Node> >::_M_default_append(unsigned long)
+  0.13      7.83     0.01                             _init
+  0.00      7.83     0.00   201929     0.00     0.00  titan::RBPriceIndex<std::greater<long> >::insert_fixup(unsigned int)
+  0.00      7.83     0.00   199066     0.00     0.00  titan::RBPriceIndex<std::less<long> >::insert_fixup(unsigned int)
+  0.00      7.83     0.00    90363     0.00     0.00  titan::RBPriceIndex<std::greater<long> >::delete_fixup(unsigned int)
+  0.00      7.83     0.00    89460     0.00     0.00  titan::RBPriceIndex<std::less<long> >::delete_fixup(unsigned int)
+  0.00      7.83     0.00       84     0.00     0.00  titan::OrderBookT<titan::PIN_Node, titan::RBPriceIndex<std::greater<long> >, titan::RBPriceIndex<std::less<long> > >::free_level_nodes(titan::PriceLevel&)
+  0.00      7.83     0.00        7     0.00     0.00  titan::OrderBookT<titan::PIN_Node, titan::RBPriceIndex<std::greater<long> >, titan::RBPriceIndex<std::less<long> > >::~OrderBookT()
+  0.00      7.83     0.00        1     0.00     0.00  std::vector<double, std::allocator<double> >::~vector()
+  0.00      7.83     0.00        1     0.00     0.00  std::vector<unsigned long, std::allocator<unsigned long> >::~vector()
+
+ %         the percentage of the total running time of the
+time       program used by this function.
+
+cumulative a running sum of the number of seconds accounted
+ seconds   for by this function and those listed above it.
+
+ self      the number of seconds accounted for by this
+seconds    function alone.  This is the major sort for this
+           listing.
+
+calls      the number of times this function was invoked, if
+           this function is profiled, else blank.
+
+ self      the average number of milliseconds spent in this
+ms/call    function per call, if this function is profiled,
+	   else blank.
+
+ total     the average number of milliseconds spent in this
+ms/call    function and its descendents per call, if this
+	   function is profiled, else blank.
+
+name       the name of the function.  This is the minor sort
+           for this listing. The index shows the location of
+	   the function in the gprof listing. If the index is
+	   in parenthesis it shows where it would appear in
+	   the gprof listing if it were to be printed.
+
+Copyright (C) 2012-2024 Free Software Foundation, Inc.
+
+Copying and distribution of this file, with or without modification,
+are permitted in any medium without royalty provided the copyright
+notice and this notice are preserved.
