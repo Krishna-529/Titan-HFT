@@ -23,6 +23,7 @@
 // tcp_gateway.hpp is included FIRST so its _GNU_SOURCE define lands before any libc header.
 //
 #include "titan/net/tcp_gateway.hpp"
+#include "titan/net/udp_publisher.hpp"
 
 #include "titan/book/matcher.hpp"
 #include "titan/book/order_book.hpp"
@@ -63,6 +64,14 @@ constexpr std::uint64_t WAL_CAP      = 1u << 22;         // ~4.2M orders (~160 M
                                                          // is noexcept) -> size for the session.
 constexpr std::uint16_t DEFAULT_PORT = 9001;
 constexpr int           MAX_GATEWAYS = 16;
+
+// Outbound market-data multicast (Publisher). MCAST_IF = "127.0.0.1" routes the feed over
+// loopback so a same-host listener receives it; set to a NIC IP for real network fan-out.
+const char*             MCAST_GROUP  = "239.1.1.1";
+constexpr std::uint16_t MCAST_PORT   = 30001;
+const char*             MCAST_IF     = "127.0.0.1";
+constexpr int           MCAST_TTL    = 1;
+constexpr std::size_t   PUB_HWM      = 1u << 12;         // publisher drains egress in 4096-trade waves
 
 using Mpsc    = MpscRing<Order, RING_MPSC>;
 using Ingress = IngressRing<RING_IN>;
@@ -167,23 +176,31 @@ int main(int argc, char** argv) {
             matcher_done.store(true, std::memory_order_release);
         });
 
-        // ---- Publisher (counter/checksum; periodic stdout, no per-trade I/O) ----
+        // ---- Publisher: drain egress and BLAST every TradeEvent out over UDP multicast ----
         std::thread publisher_thread([&] {
-            std::uint64_t fills = 0, rejects = 0, chk = 0;
+            UdpPublisher udp(MCAST_GROUP, MCAST_PORT, MCAST_IF, MCAST_TTL);
+            std::vector<TradeEvent> batch;
+            batch.reserve(PUB_HWM);
+            std::uint64_t total = 0, chk = 0;
+            auto flush = [&] { if (!batch.empty()) { udp.publish(batch); total += batch.size(); batch.clear(); } };
             while (!matcher_done.load(std::memory_order_acquire) || !egress.empty_approx()) {
                 egress.consume_batch([&](const TradeEvent& t) {
                     chk += hash_trade(t);
-                    if (t.status == TRADE_STATUS_REJECTED) ++rejects; else ++fills;
-                    const std::uint64_t total = fills + rejects;
-                    if (total % 100000 == 0)
-                        std::printf("[publisher] events=%llu  fills=%llu  rejects=%llu  chk=%llu\n",
-                                    (unsigned long long)total, (unsigned long long)fills,
-                                    (unsigned long long)rejects, (unsigned long long)chk);
+                    batch.push_back(t);
+                    if (batch.size() >= PUB_HWM) flush();       // bounded buffer -> no hot-path realloc
+                    if ((total + batch.size()) % 100000 == 0)
+                        std::printf("[publisher] multicast events=%llu  datagrams=%llu  dropped=%llu\n",
+                                    (unsigned long long)(total + batch.size()),
+                                    (unsigned long long)udp.datagrams(), (unsigned long long)udp.dropped());
                 });
+                flush();
             }
-            std::printf("[publisher] FINAL events=%llu  fills=%llu  rejects=%llu  chk=%llu\n",
-                        (unsigned long long)(fills + rejects), (unsigned long long)fills,
-                        (unsigned long long)rejects, (unsigned long long)chk);
+            flush();
+            std::printf("[publisher] FINAL events=%llu  chk=%llu  | UDP sent=%llu dropped=%llu "
+                        "datagrams=%llu (%s:%u via %s)\n",
+                        (unsigned long long)total, (unsigned long long)chk,
+                        (unsigned long long)udp.sent(), (unsigned long long)udp.dropped(),
+                        (unsigned long long)udp.datagrams(), MCAST_GROUP, MCAST_PORT, MCAST_IF);
         });
 
         // ---- Gateways: one epoll thread each, all feeding the shared MpscRing ----
