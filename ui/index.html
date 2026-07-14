@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TITAN HFT — Market Terminal</title>
+<script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root{
+    --bg:#0a0d11; --panel:#0f141a; --panel2:#0c1116; --grid:#1a232e;
+    --fg:#c8d2de; --dim:#5c6a7a; --faint:#38424f;
+    --bid:#25d07c; --bid-bg:rgba(37,208,124,.13);
+    --ask:#ff5563; --ask-bg:rgba(255,85,99,.13);
+    --amber:#f0b429; --cyan:#41c7e0; --accent:#8a7dff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--fg);
+    font:12px/1.35 "SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;-webkit-font-smoothing:antialiased}
+  .app{display:grid;grid-template-rows:auto minmax(0,1fr) auto;height:100vh;gap:1px;background:var(--grid)}
+  .main{display:grid;grid-template-columns:1.6fr 1fr;grid-template-rows:minmax(0,1.15fr) minmax(0,1fr) auto;
+    grid-template-areas:"chart tape" "book risk" "book entry";gap:1px;background:var(--grid);min-height:0}
+  .a-chart{grid-area:chart} .a-tape{grid-area:tape} .a-book{grid-area:book} .a-risk{grid-area:risk} .a-entry{grid-area:entry}
+  .panel{background:var(--panel);display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .phead{padding:6px 10px;color:var(--dim);text-transform:uppercase;letter-spacing:.12em;font-size:10px;
+    border-bottom:1px solid var(--grid);display:flex;justify-content:space-between;background:var(--panel2);flex:0 0 auto}
+  .phead .k{color:var(--faint)}
+  .pbody{overflow:auto;min-height:0;flex:1}
+
+  header{background:var(--panel2);display:flex;align-items:center;gap:20px;padding:8px 14px;flex:0 0 auto;border-bottom:1px solid var(--grid)}
+  header .brand{font-weight:700;letter-spacing:.22em;color:#eaf0f6} header .brand b{color:var(--accent)}
+  header .stat{display:flex;flex-direction:column;line-height:1.2}
+  header .stat .lbl{color:var(--faint);font-size:9px;text-transform:uppercase;letter-spacing:.1em}
+  header .stat .val{font-size:14px;font-variant-numeric:tabular-nums}
+  header .spacer{flex:1}
+  .conn{display:flex;align-items:center;gap:7px;color:var(--dim)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--ask);box-shadow:0 0 8px var(--ask)}
+  .conn.up .dot{background:var(--bid);box-shadow:0 0 8px var(--bid)}
+  .gw{font-size:10px;color:var(--faint);border:1px solid var(--faint);border-radius:3px;padding:1px 6px}
+  .gw.on{color:var(--bid);border-color:rgba(37,208,124,.4)}
+
+  #chart{flex:1;min-height:0}
+  .book{display:grid;grid-template-columns:1fr 1fr;min-height:0}
+  .book .side{overflow:auto;min-height:0} .book .side.asks{border-left:1px solid var(--grid)}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th{position:sticky;top:0;background:var(--panel2);color:var(--faint);font-weight:400;text-align:right;
+    padding:4px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--grid);z-index:1}
+  td{padding:2px 10px;text-align:right;position:relative;white-space:nowrap}
+  .book tr td:first-child{text-align:left}
+  .depth{position:absolute;top:0;bottom:0;right:0;z-index:0}
+  .book .bids .depth{background:var(--bid-bg)} .book .asks .depth{background:var(--ask-bg)}
+  .book td span{position:relative;z-index:1}
+  .book .bids .px{color:var(--bid)} .book .asks .px{color:var(--ask)}
+  .book .best td{background:rgba(255,255,255,.03)}
+  .spread-row{padding:5px 10px;text-align:center;color:var(--dim);background:var(--panel2);
+    border-top:1px solid var(--grid);font-size:11px;flex:0 0 auto} .spread-row b{color:var(--fg)}
+
+  .tape td{padding:2px 10px}
+  .tape .buy .px,.tape .buy .arw{color:var(--bid)} .tape .sell .px,.tape .sell .arw{color:var(--ask)}
+  .tape .reject{color:var(--amber);opacity:.85} .tape .seq{color:var(--faint);text-align:right}
+
+  .risk td,.risk th{text-align:left} .risk td.num,.risk th.num{text-align:right}
+  .pnl-pos{color:var(--bid)} .pnl-neg{color:var(--ask)}
+  .badge{padding:1px 7px;border-radius:3px;font-size:10px;letter-spacing:.06em;border:1px solid var(--faint);color:var(--dim)}
+  .badge.live{color:var(--bid);border-color:rgba(37,208,124,.4);background:var(--bid-bg)}
+  .badge.stale{color:var(--amber);border-color:rgba(240,180,41,.4)}
+  .inv-long{color:var(--bid)} .inv-short{color:var(--ask)} .inv-flat{color:var(--dim)}
+  .empty{padding:14px 10px;color:var(--faint)}
+
+  /* order entry */
+  .entry{padding:10px;display:flex;flex-direction:column;gap:8px}
+  .entry .row{display:flex;gap:8px;align-items:center}
+  .entry label{width:64px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.08em}
+  .entry input{flex:1;background:#070a0d;border:1px solid var(--grid);color:var(--fg);padding:6px 8px;
+    font:inherit;border-radius:3px;text-align:right;font-variant-numeric:tabular-nums}
+  .entry input:focus{outline:none;border-color:var(--accent)}
+  .entry .btns{display:flex;gap:8px;margin-top:2px}
+  .entry button{flex:1;padding:9px;border:1px solid;border-radius:3px;font:inherit;font-weight:700;
+    letter-spacing:.1em;cursor:pointer;background:transparent}
+  .entry .buy{color:var(--bid);border-color:var(--bid)} .entry .buy:hover{background:var(--bid-bg)}
+  .entry .sell{color:var(--ask);border-color:var(--ask)} .entry .sell:hover{background:var(--ask-bg)}
+  .entry .oe-status{min-height:15px;font-size:11px;color:var(--dim)}
+  .entry .oe-status.ok{color:var(--bid)} .entry .oe-status.err{color:var(--ask)}
+
+  footer{background:var(--panel2);color:var(--faint);font-size:10px;padding:5px 12px;flex:0 0 auto;
+    display:flex;justify-content:space-between}
+  ::-webkit-scrollbar{width:8px;height:8px} ::-webkit-scrollbar-thumb{background:#1e2833;border-radius:4px}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">TITAN<b>//</b>HFT</div>
+    <div class="stat"><span class="lbl">Last</span><span class="val" id="last">—</span></div>
+    <div class="stat"><span class="lbl">Spread</span><span class="val" id="spread">—</span></div>
+    <div class="stat"><span class="lbl">Trades</span><span class="val" id="trades">0</span></div>
+    <div class="stat"><span class="lbl">Volume</span><span class="val" id="volume">0</span></div>
+    <div class="stat"><span class="lbl">Rejects</span><span class="val" id="rejects">0</span></div>
+    <div class="spacer"></div>
+    <span class="gw" id="gw">GATEWAY ✕</span>
+    <div class="conn" id="conn"><span class="dot"></span><span id="connlbl">CONNECTING</span></div>
+  </header>
+
+  <div class="main">
+    <div class="panel a-chart">
+      <div class="phead"><span>OHLCV · 1s</span><span class="k" id="chartmeta">candles</span></div>
+      <div id="chart"></div>
+    </div>
+
+    <div class="panel a-tape">
+      <div class="phead"><span>The Tape</span><span class="k">side · price · qty</span></div>
+      <div class="pbody"><table class="tape"><tbody id="tape"></tbody></table></div>
+    </div>
+
+    <div class="panel a-book">
+      <div class="phead"><span>L2 Order Book</span><span class="k" id="bookmeta">bids · asks</span></div>
+      <div class="book pbody">
+        <div class="side bids"><table><thead><tr><th style="text-align:left">Bid</th><th>Qty</th><th>Ord</th></tr></thead><tbody id="bids"></tbody></table></div>
+        <div class="side asks"><table><thead><tr><th style="text-align:left">Ask</th><th>Qty</th><th>Ord</th></tr></thead><tbody id="asks"></tbody></table></div>
+      </div>
+      <div class="spread-row" id="spreadrow">bid <b>—</b> | ask <b>—</b></div>
+    </div>
+
+    <div class="panel a-risk">
+      <div class="phead"><span>Risk Desk</span><span class="k" id="riskmeta">0 bots</span></div>
+      <div class="pbody"><table class="risk">
+        <thead><tr><th>Bot</th><th class="num">PnL</th><th class="num">Inventory</th><th>Status</th><th class="num">Age</th></tr></thead>
+        <tbody id="bots"><tr><td class="empty" colspan="5">no bots connected — start a simulator on tcp :8081</td></tr></tbody>
+      </table></div>
+    </div>
+
+    <div class="panel a-entry">
+      <div class="phead"><span>Manual Order Entry</span><span class="k">LIMIT → gateway :9099</span></div>
+      <div class="entry">
+        <div class="row"><label>Price</label><input id="oe-price" type="number" step="1" value="10000"></div>
+        <div class="row"><label>Qty</label><input id="oe-qty" type="number" step="1" min="1" value="5"></div>
+        <div class="btns">
+          <button class="buy"  onclick="sendOrder('BUY')">BUY</button>
+          <button class="sell" onclick="sendOrder('SELL')">SELL</button>
+        </div>
+        <div class="oe-status" id="oe-status">enter a price &amp; qty, then BUY / SELL</div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span>book refreshes per L2 snapshot (~every 10k engine orders) · tape &amp; candles live per trade · prices in ticks</span>
+    <span id="foot">—</span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const nf = new Intl.NumberFormat("en-US");
+const fmt   = n => (n === null || n === undefined) ? "—" : nf.format(n);
+const money = n => (n >= 0 ? "+" : "") + n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+
+/* ---------- candlestick chart (TradingView Lightweight Charts) ---------- */
+let chart=null, candleSeries=null, volSeries=null, chartInit=false, lastBarT=0;
+function initChart(){
+  const el = $("chart");
+  if(!window.LightweightCharts){ el.innerHTML='<div class="empty">Lightweight Charts CDN blocked/offline</div>'; return; }
+  chart = LightweightCharts.createChart(el, {
+    layout:{background:{color:"transparent"}, textColor:"#5c6a7a", fontFamily:"monospace", fontSize:11},
+    grid:{vertLines:{color:"#131b23"}, horzLines:{color:"#131b23"}},
+    timeScale:{timeVisible:true, secondsVisible:true, borderColor:"#1a232e"},
+    rightPriceScale:{borderColor:"#1a232e"},
+    crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+    width:el.clientWidth, height:el.clientHeight,
+  });
+  candleSeries = chart.addCandlestickSeries({upColor:"#25d07c",downColor:"#ff5563",
+    wickUpColor:"#25d07c",wickDownColor:"#ff5563",borderVisible:false});
+  volSeries = chart.addHistogramSeries({priceFormat:{type:"volume"}, priceScaleId:""});
+  volSeries.priceScale().applyOptions({scaleMargins:{top:0.84,bottom:0}});
+  new ResizeObserver(()=>chart && chart.resize(el.clientWidth, el.clientHeight)).observe(el);
+}
+const toCandle = c => ({time:c.time, open:c.open, high:c.high, low:c.low, close:c.close});
+const toVol    = c => ({time:c.time, value:c.volume, color: c.close>=c.open ? "rgba(37,208,124,.5)" : "rgba(255,85,99,.5)"});
+function updateChart(candles){
+  if(!chart || !candles || !candles.length) return;
+  if(!chartInit){
+    candleSeries.setData(candles.map(toCandle));
+    volSeries.setData(candles.map(toVol));
+    chartInit = true;
+  } else {
+    for(const c of candles){ if(c.time >= lastBarT){ candleSeries.update(toCandle(c)); volSeries.update(toVol(c)); } }
+  }
+  lastBarT = candles[candles.length-1].time;
+}
+
+/* ---------- panel renderers ---------- */
+function depthRows(levels){
+  if(!levels || !levels.length) return `<tr><td class="empty" colspan="3">— empty —</td></tr>`;
+  const max = levels.reduce((m,l)=>Math.max(m,l[1]),1);
+  return levels.map((l,i)=>{
+    const [px,qty,ord]=l, w=Math.max(2,Math.round(qty/max*100)), best=i===0?' class="best"':'';
+    return `<tr${best}><td><span class="px">${fmt(px)}</span><div class="depth" style="width:${w}%"></div></td>`+
+           `<td><span>${fmt(qty)}</span></td><td><span>${fmt(ord)}</span></td></tr>`;
+  }).join("");
+}
+function tapeRows(tape){
+  if(!tape || !tape.length) return `<tr><td class="empty" colspan="4">— no prints —</td></tr>`;
+  return tape.map(t=>{
+    if(t.status==="REJECT") return `<tr class="reject"><td>REJ</td><td class="px">${fmt(t.price)}</td><td>—</td><td class="seq">#${t.seq}</td></tr>`;
+    const cls=t.side==="BUY"?"buy":"sell", arw=t.side==="BUY"?"▲":"▼";
+    return `<tr class="${cls}"><td class="arw">${arw} ${t.side}</td><td class="px">${fmt(t.price)}</td><td>${fmt(t.qty)}</td><td class="seq">#${t.seq}</td></tr>`;
+  }).join("");
+}
+function botRows(bots){
+  if(!bots || !bots.length) return `<tr><td class="empty" colspan="5">no bots connected — start a simulator on tcp :8081</td></tr>`;
+  return bots.map(b=>{
+    const pnl=Number(b.pnl)||0, inv=Number(b.inventory)||0;
+    const invc=inv>0?"inv-long":inv<0?"inv-short":"inv-flat", badge=b.live?"live":"stale";
+    return `<tr><td>${b.bot_id}</td><td class="num ${pnl>=0?"pnl-pos":"pnl-neg"}">${money(pnl)}</td>`+
+           `<td class="num ${invc}">${inv>0?"+":""}${fmt(inv)}</td>`+
+           `<td><span class="badge ${badge}">${b.status}</span></td><td class="num">${b.age}s</td></tr>`;
+  }).join("");
+}
+function render(s){
+  const st=s.stats||{};
+  $("last").textContent=fmt(st.last); $("spread").textContent=st.spread==null?"—":fmt(st.spread);
+  $("trades").textContent=fmt(st.trades); $("volume").textContent=fmt(st.volume); $("rejects").textContent=fmt(st.rejects);
+  const gw=$("gw"); const on=!!st.gateway; gw.classList.toggle("on",on); gw.textContent=on?"GATEWAY ✓":"GATEWAY ✕";
+  const bk=s.book||{};
+  $("bids").innerHTML=depthRows(bk.bids); $("asks").innerHTML=depthRows(bk.asks);
+  $("bookmeta").textContent=`${(bk.bids||[]).length} bids · ${(bk.asks||[]).length} asks · seq ${fmt(bk.seq)}`;
+  $("spreadrow").innerHTML=`bid <b>${fmt(st.best_bid)}</b> &nbsp;|&nbsp; ask <b>${fmt(st.best_ask)}</b> &nbsp;|&nbsp; spread <b>${st.spread==null?"—":fmt(st.spread)}</b>`;
+  $("tape").innerHTML=tapeRows(s.tape);
+  const bots=s.bots||[]; $("bots").innerHTML=botRows(bots); $("riskmeta").textContent=`${bots.length} bot${bots.length===1?"":"s"}`;
+  $("chartmeta").textContent=`${(s.candles||[]).length} bars`;
+  $("foot").textContent="updated "+new Date((s.ts||Date.now()/1000)*1000).toLocaleTimeString();
+  updateChart(s.candles);
+}
+
+/* ---------- order entry ---------- */
+function setOE(text, cls){ const e=$("oe-status"); e.textContent=text; e.className="oe-status"+(cls?(" "+cls):""); }
+function sendOrder(side){
+  const price=Number($("oe-price").value), qty=Number($("oe-qty").value);
+  if(!ws || ws.readyState!==1){ setOE("websocket not connected","err"); return; }
+  if(!(price>0)||!(qty>0)){ setOE("enter a valid price & qty","err"); return; }
+  ws.send(JSON.stringify({type:"order", side, price, qty}));
+  setOE(`sending ${side} ${qty} @ ${price}…`,null);
+}
+
+/* ---------- websocket ---------- */
+function setConn(up){ const c=$("conn"); c.classList.toggle("up",up); $("connlbl").textContent=up?"LIVE":"DISCONNECTED"; }
+let ws=null;
+function connect(){
+  ws=new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen   =()=>setConn(true);
+  ws.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch(_){return;}
+    if(m.type==="order_ack") setOE(m.detail, m.ok?"ok":"err"); else render(m); };
+  ws.onclose  =()=>{ setConn(false); setTimeout(connect,1000); };
+  ws.onerror  =()=>{ try{ws.close();}catch(_){} };
+}
+initChart();
+connect();
+</script>
+</body>
+</html>

@@ -15,3 +15,8 @@ titan-server
 .idea/
 *.swp
 .DS_Store
+
+# Python UI (Phase 2)
+ui/.venv/
+__pycache__/
+*.pyc
