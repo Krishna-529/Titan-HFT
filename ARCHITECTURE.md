@@ -49,18 +49,7 @@ targets the memory hierarchy.
 
 ## 2. System Topology
 
-```
-   N gateways (T1..Tk)          T(seq)              T(match)            T(pub)      T(snap=T5)
-  ┌───────────────┐  MPSC   ┌────────────┐  SPSC  ┌──────────┐  SPSC  ┌─────────┐
-  │ TCP epoll     │ ──────▶ │ Sequencer  │ ─────▶ │ Matcher  │ ─────▶ │Publisher│ ─▶ UDP :30001
-  │ (edge-trig)   │  ring   │ seq+WAL    │ ingress│ PIN book │ egress │ (trades)│    (incremental)
-  └───────────────┘         └────────────┘        └────┬─────┘        └─────────┘
-        │                                               │ every 10k orders
-   raw Order (40B)                                       ▼  wait-free L2 serialize
-                                              ┌──────────────────────┐
-                                              │ SnapshotPool (3-slot) │ ─▶ T5 ─▶ UDP :30002
-                                              └──────────────────────┘         (L2 snapshot)
-```
+![Titan HFT architecture](Architecture.png)
 
 | Thread | Role | Consumes | Produces | Hand-off out |
 |---|---|---|---|---|
@@ -115,7 +104,8 @@ encodes, in one word, both "whose turn is it to write this slot" and "is the pay
 read." The hand-off is a two-step barrier:
 
 1. **Claim (multi-producer).** A producer reads the shared `enqueue` cursor and attempts
-   `compare_exchange_weak(pos, pos+1)` — a wait-free-ish CAS race among the network threads.
+   `compare_exchange_weak(pos, pos+1)` — lock-free CAS contention among the network threads (a
+   losing thread retries, so the claim is lock-free, not wait-free).
    The winner owns slot `pos`; losers retry with the refreshed cursor. A producer touches the
    payload **only after** winning the slot.
 2. **Publish (release).** After the `memcpy` of the payload, the producer does
@@ -219,7 +209,7 @@ single largest cost. The refactor widens `SlabEntry` to **32 bytes, `alignas(32)
 the cancel-hot fields inline:
 
 ```
-struct alignas(32) SlabEntry {   // one cache line per lookup, never split
+struct alignas(32) SlabEntry {   // 32 B, alignas(32): two pack into one 64-byte L1 line, no straddle
     uint32 node; uint32 slot;    // physical location (for the O(1) FIFO unlink)
     PriceTick price;             // shadowed: RB level lookup on cancel
     Qty       remaining;         // shadowed: level total_qty adjust
@@ -228,10 +218,11 @@ struct alignas(32) SlabEntry {   // one cache line per lookup, never split
 };
 ```
 
-`cancel(id)` is now satisfied from **one cache-line-aligned, id-indexed load** — pure
-arithmetic — and touches the node only for the O(1) occupancy-bit clear + FIFO unlink. The
-cold 2.5 KB slot payload is **never fetched**. `alignas(32)` guarantees an entry never
-straddles a cache line (one line pulled per lookup, no split).
+`cancel(id)` is now satisfied from **one id-indexed load** — pure arithmetic — and touches the
+node only for the O(1) occupancy-bit clear + FIFO unlink. The cold 2.5 KB slot payload is
+**never fetched**. `alignas(32)` keeps an entry from straddling a cache line: two `SlabEntry`s
+pack into a 64-byte L1 line (the hardware fetches the whole line, adjacent entry included), so a
+lookup pulls exactly one line rather than two.
 
 `remaining` is mutable (a resting maker is decremented on partial fill), so correctness
 requires a sync: the matcher calls `note_partial_fill(id, remaining)` at the one site a

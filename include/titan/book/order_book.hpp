@@ -48,9 +48,9 @@ struct alignas(32) SlabEntry {
     PriceTick     price;       // 8  cached resting price   (RB level lookup on cancel)
     Qty           remaining;   // 4  cached resting qty      (level total_qty adjust; synced on partial fill)
     Side          side;        // 1  cached side             (bid/ask map select)
-    std::uint8_t  _pad[11];    // 11 -> 32 B; alignas(32) => exactly one cache line, never split
+    std::uint8_t  _pad[11];    // 11 -> 32 B; alignas(32) => two per 64-byte L1 line, no straddle
 };
-static_assert(sizeof(SlabEntry)  == 32, "SlabEntry must be 32 bytes (single-cache-line lookup)");
+static_assert(sizeof(SlabEntry)  == 32, "SlabEntry must be 32 bytes (two per 64-byte cache line, no straddle)");
 static_assert(alignof(SlabEntry) == 32, "SlabEntry must be 32-byte aligned (no cache-line split)");
 static_assert(std::is_trivially_copyable_v<SlabEntry>);
 
