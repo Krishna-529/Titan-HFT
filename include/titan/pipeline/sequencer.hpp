@@ -24,11 +24,14 @@
 //
 // Concrete class, no virtuals -> fully inlinable, so the measured pipeline numbers hold.
 //
-// RECORD SCOPE (conscious decision): the WAL logs Order records ONLY. Today nothing but
-// new orders traverses the ingress ring (there are no cancels/modifies on that path), so
-// an Order-only log is a complete command stream. IF cancels/modifies ever enter ingress,
-// this WAL must become a tagged command log (an op-type discriminator + a union/variant
-// payload) -- replaying orders alone would then silently diverge from live state.
+// RECORD SCOPE: the WAL logs Order records verbatim, and the Order's `type` field IS the
+// command tag -- LIMIT/MARKET/IOC are new-order intents, CANCEL names a resting id to pull.
+// Both adds and cancels traverse the ingress ring and are journaled identically, so the log
+// is a complete, ordered command stream. replay() reconstructs state by re-submitting each
+// record through the Matcher, which dispatches on `type` (crossing for orders, book.cancel
+// for CANCEL) -- so a cancelled order does NOT reappear after recovery. Any future op that
+// needs MORE than the 40-byte Order envelope (e.g. modify-with-new-price) would need a wider
+// record; single-field commands like cancel fit the envelope as-is.
 //
 #include "titan/io/journaler.hpp"        // must be first (defines _DEFAULT_SOURCE)
 

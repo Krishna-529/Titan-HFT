@@ -25,16 +25,18 @@
 //   * circuit breaker: |inventory| > HALT_INV -> stop quoting and FLATTEN with marketable IOC.
 //
 // -------------------------------------------------------------------------------------------
-// PROTOCOL LIMITATION (important, and deliberately worked around here)
-//   The wire Order has no CANCEL action -- OrderType is only LIMIT/MARKET/IOC, the gateway
-//   submits every order, and OrderBook::add() REJECTS a duplicate id. So a client cannot cancel
-//   or replace a resting quote today. Consequences, and how this bot copes:
-//     1. Re-quote posts a NEW id each time; we THROTTLE (only when the mid moves >= REQUOTE_TICKS
-//        or a timer elapses) so stale quotes don't pile up unboundedly. Old quotes rest until hit.
-//     2. The "mass-cancel" circuit breaker cannot cancel; instead it HALTS quoting and sends
-//        marketable IOC to drive inventory back toward flat -- the true risk-neutralizing action.
-//   Wiring a real cancel path (an op-type on the wire -> gateway -> book.cancel) is an engine
-//   change tracked separately; this bot is written to the protocol as it exists.
+// ORDER MANAGEMENT (now that the wire speaks CANCEL -- OrderType::CANCEL, id = target)
+//   * Re-quote is cancel/replace: on each cycle we CANCEL the two resting quote ids, then post
+//     a fresh bid/ask. The book never accumulates stale quotes -- there is at most one live
+//     bid and one live ask per bot at any time.
+//   * The circuit breaker (|inventory| > HALT_INV) does BOTH halves of de-risking, because they
+//     are different things: (1) CANCEL every resting quote to stop taking on new inventory, and
+//     (2) since a cancel removes UNEXECUTED quotes but cannot undo already-EXECUTED fills, send
+//     marketable IOC to trade the residual position back toward flat. Cancel != inventory unwind.
+//
+// A cancel is fire-and-forget and optimistic: we drop the id from our local book immediately.
+// If it had already been (partially) filled, the engine cancel is a harmless no-op and the trade
+// feed has already told us about the fill, so our inventory stays correct either way.
 //
 // Build/run:  see bot.sh   (g++ -O3 -std=c++20 -pthread -Iinclude ...)
 //
@@ -63,6 +65,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 using namespace titan;
 
@@ -179,6 +183,17 @@ bool fire(int gw_fd, std::uint64_t id, Side side, OrderType type, PriceTick px, 
     return true;
 }
 
+// Send a CANCEL command for a resting id (OrderType::CANCEL, id = target; price/qty ignored by
+// the engine). Optimistically drop it from our local book -- if it was already filled the engine
+// cancel is a no-op and the trade feed already adjusted our inventory. `side` is a routing hint only.
+bool cancel_order(int gw_fd, std::uint64_t id, Side side) {
+    Order o{};
+    o.id = id; o.seq = 0; o.side = side; o.type = OrderType::CANCEL;
+    if (!send_all(gw_fd, &o, sizeof(o))) return false;
+    { std::lock_guard<std::mutex> lk(g_mx); g_orders.erase(id); }
+    return true;
+}
+
 std::uint64_t next_id() {
     if (g_next_id >= ID_MAX) g_next_id = ID_BASE;   // demo-scale wrap (won't collide in a short run)
     return g_next_id++;
@@ -272,7 +287,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // unbuffered: banner/status show live even when piped
     std::printf("[MM] %s  gateway tcp %s:%u   feeds udp %s:%u/%u   ui tcp %s:%u\n",
                 BOT_ID, GW_HOST, GW_PORT, MCAST_GROUP, TRADES_PORT, SNAP_PORT, UI_HOST, UI_PORT);
-    std::printf("[MM] half_spread=%lld skew@%ld halt@%ld qty=%u   (NOTE: no wire cancel -> IOC-flatten breaker)\n",
+    std::printf("[MM] half_spread=%lld skew@%ld halt@%ld qty=%u   (wire CANCEL: cancel/replace + mass-cancel breaker)\n",
                 (long long)HALF_SPREAD, SKEW_THRESHOLD, HALT_INV, QUOTE_QTY);
 
     std::thread snap_t(snapshot_thread);
@@ -281,6 +296,7 @@ int main() {
     int gw_fd = -1, ui_fd = -1;
     PriceTick last_quote_mid = 0;
     bool      have_quoted = false;
+    std::uint64_t cur_bid_id = 0, cur_ask_id = 0;   // the (at most) two quotes we currently rest
     std::uint64_t last_tele = 0, last_quote_ms = 0;
 
     while (g_run.load()) {
@@ -311,8 +327,19 @@ int main() {
 
         const char* status;
         if (inv > HALT_INV || inv < -HALT_INV) {
-            // ---- circuit breaker: stop quoting, flatten via marketable IOC ----
+            // ---- circuit breaker ----
             status = "HALTED";
+            // (1) MASS-CANCEL every resting quote so we stop accruing inventory.
+            std::vector<std::pair<std::uint64_t, Side>> live;
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                live.reserve(g_orders.size());
+                for (const auto& kv : g_orders) live.emplace_back(kv.first, kv.second.side);
+            }
+            for (const auto& [oid, sd] : live) cancel_order(gw_fd, oid, sd);
+            cur_bid_id = cur_ask_id = 0; have_quoted = false;
+            // (2) UNWIND the executed position with marketable IOC -- a cancel removes unfilled
+            //     quotes but cannot undo fills, so getting flat still needs to trade.
             if (inv > 0) fire(gw_fd, next_id(), Side::SELL, OrderType::IOC, mid - IOC_CROSS, FLATTEN_CHUNK);
             else         fire(gw_fd, next_id(), Side::BUY,  OrderType::IOC, mid + IOC_CROSS, FLATTEN_CHUNK);
         } else {
@@ -329,15 +356,23 @@ int main() {
             const PriceTick ask_px = r + HALF_SPREAD;
             status = (skew != 0) ? "SKEWING" : "QUOTING";
 
-            // Throttle: re-post when the mid has moved, OR every REQUOTE_MS to refresh liquidity
-            // (no wire cancel, so every quote is a fresh resting order -- keep the churn bounded).
+            // Throttle: re-quote when the mid has moved, OR every REQUOTE_MS to refresh.
             const PriceTick moved = have_quoted ? (mid > last_quote_mid ? mid - last_quote_mid
                                                                         : last_quote_mid - mid) : REQUOTE_TICKS;
             const bool stale = (now_ms() - last_quote_ms) >= REQUOTE_MS;
             if (!have_quoted || moved >= REQUOTE_TICKS || stale) {
-                const bool ok1 = (bid_px > 0) && fire(gw_fd, next_id(), Side::BUY,  OrderType::LIMIT, bid_px, QUOTE_QTY);
-                const bool ok2 = fire(gw_fd, next_id(), Side::SELL, OrderType::LIMIT, ask_px, QUOTE_QTY);
+                // CANCEL/REPLACE: pull the prior quotes first, then post fresh ones. At most one
+                // live bid + one live ask at any instant -> the book never fills with our staleness.
+                if (cur_bid_id) cancel_order(gw_fd, cur_bid_id, Side::BUY);
+                if (cur_ask_id) cancel_order(gw_fd, cur_ask_id, Side::SELL);
+
+                const std::uint64_t bid_id = next_id(), ask_id = next_id();
+                bool ok1 = true, ok2;
+                if (bid_px > 0) ok1 = fire(gw_fd, bid_id, Side::BUY, OrderType::LIMIT, bid_px, QUOTE_QTY);
+                ok2 = fire(gw_fd, ask_id, Side::SELL, OrderType::LIMIT, ask_px, QUOTE_QTY);
                 if (!ok1 || !ok2) { ::close(gw_fd); gw_fd = -1; continue; }   // gateway dropped -> reconnect
+                cur_bid_id = (bid_px > 0) ? bid_id : 0;
+                cur_ask_id = ask_id;
                 last_quote_mid = mid; have_quoted = true; last_quote_ms = now_ms();
             }
         }

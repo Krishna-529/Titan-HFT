@@ -43,6 +43,7 @@ struct MatchResult {
     std::uint32_t trades   = 0;      // number of fills generated
     bool          rested   = false;  // residual added to the book (LIMIT only)
     bool          rejected = false;  // residual could NOT be admitted (resource exhaustion) -> REJECTED event emitted
+    bool          canceled = false;  // a CANCEL command hit a live resting order and removed it
 };
 
 template <class BookT>
@@ -64,6 +65,15 @@ public:
     template <class Sink>
     MatchResult submit(Order in, Sink& sink) noexcept {
         MatchResult r{};
+
+        // CANCEL COMMAND -- not an order to cross. Route the target id straight to the O(1)
+        // id-slab cancel and return. This runs on the matcher thread (the book's single writer),
+        // so no locking; book_.cancel is noexcept and reads price/side/qty from the slab, never
+        // the cold node payload. No trade is emitted and the price bounds do not apply.
+        if (in.type == OrderType::CANCEL) {
+            r.canceled = book_.cancel(in.id);
+            return r;
+        }
 
         // BOUNDARY GATE -- and the ONLY place a boundary rejection may be emitted.
         //

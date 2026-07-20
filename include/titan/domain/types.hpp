@@ -14,7 +14,13 @@ using OrderId   = std::uint64_t;  // globally unique order id
 using Seq       = std::uint64_t;  // arrival sequence / timestamp (time priority)
 
 enum class Side      : std::uint8_t { BUY = 0, SELL = 1 };
-enum class OrderType : std::uint8_t { LIMIT = 0, MARKET = 1, IOC = 2 };
+
+// LIMIT/MARKET/IOC are new-order intents. CANCEL is a COMMAND carried in the same 40-byte
+// Order envelope (no wire-size change): its `id` field names the RESTING order to remove, and
+// price/quantity are ignored. The `type` field is thus the op-discriminator all the way down
+// the pipe -- gateway -> ingress ring -> matcher -> book.cancel -- and, because the WAL logs
+// the Order verbatim, it doubles as the command tag that makes replay reconstruct cancels.
+enum class OrderType : std::uint8_t { LIMIT = 0, MARKET = 1, IOC = 2, CANCEL = 3 };
 
 // Sentinel meaning "no index" for pool-based (index) links. Chosen as the max
 // u32 so it can never collide with a real pool slot.

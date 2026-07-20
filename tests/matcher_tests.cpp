@@ -368,3 +368,79 @@ TEST_CASE(matcher_rejects_gracefully_on_node_pool_exhaustion) {
     CHECK(tr[1].status == TRADE_STATUS_FILL);
     CHECK(book.active_orders() == 0u);
 }
+
+// ------------------------------------------------------------ WIRE CANCEL routing
+// A CANCEL command submitted through the matcher must pull the named resting order via the
+// O(1) book path -- no crossing, no trade, no residual. `id` names the target; price is ignored.
+TEST_CASE(matcher_routes_cancel_to_book) {
+    Arena arena(16u * 1024 * 1024);
+    OrderBook book(arena, 1024);
+    Matcher m(book);
+    VecSink tr; tr.reserve(16);
+
+    book.add(mk(1, Side::SELL, 100, 10));               // resting ask id1
+    book.add(mk(2, Side::SELL, 101, 5));                // resting ask id2
+    CHECK(book.active_orders() == 2u);
+
+    MatchResult r = m.submit(mk(1, Side::SELL, 0, 0, OrderType::CANCEL), tr);  // cancel id1
+
+    CHECK(r.canceled);
+    CHECK(!r.rejected);
+    CHECK(r.filled == 0u);
+    CHECK(r.trades == 0u);
+    CHECK(tr.empty());                                  // a cancel emits nothing
+    CHECK(book.active_orders() == 1u);                  // id1 gone, id2 remains
+    REQUIRE(book.best_ask() != nullptr);
+    CHECK(book.best_ask()->price == 101);               // id1@100 pulled -> best ask is now id2@101
+}
+
+// A CANCEL for an id that is not live is a safe no-op (never crashes, changes nothing).
+TEST_CASE(matcher_cancel_of_unknown_id_is_safe_noop) {
+    Arena arena(16u * 1024 * 1024);
+    OrderBook book(arena, 1024);
+    Matcher m(book);
+    VecSink tr; tr.reserve(16);
+
+    book.add(mk(1, Side::BUY, 99, 5));
+    MatchResult r = m.submit(mk(999, Side::BUY, 0, 0, OrderType::CANCEL), tr);   // id 999 never existed
+
+    CHECK(!r.canceled);
+    CHECK(book.active_orders() == 1u);
+    CHECK(tr.empty());
+}
+
+// A CANCEL is exempt from the price boundary gate: an out-of-range (or zero) price must NOT
+// turn a legitimate cancel into a REJECTED event.
+TEST_CASE(matcher_cancel_is_exempt_from_price_bounds) {
+    Arena arena(16u * 1024 * 1024);
+    OrderBook book(arena, 1024);
+    Matcher m(book);
+    VecSink tr; tr.reserve(16);
+
+    book.add(mk(1, Side::BUY, 100, 5));
+    // Garbage price on the cancel envelope -- ignored, cancel still lands.
+    MatchResult r = m.submit(mk(1, Side::BUY, MAX_VALID_PRICE + 1, 0, OrderType::CANCEL), tr);
+
+    CHECK(r.canceled);
+    CHECK(!r.rejected);                                 // NOT rejected by the price gate
+    CHECK(book.active_orders() == 0u);
+    CHECK(tr.empty());
+}
+
+// Cancel-then-re-add of the SAME id: the slab slot is freed on cancel, so the id is reusable.
+// (This is what lets a market maker re-quote by cancelling then re-posting.)
+TEST_CASE(matcher_cancel_frees_id_for_reuse) {
+    Arena arena(16u * 1024 * 1024);
+    OrderBook book(arena, 1024);
+    Matcher m(book);
+    VecSink tr; tr.reserve(16);
+
+    CHECK(book.add(mk(7, Side::SELL, 100, 5)));
+    CHECK(!book.add(mk(7, Side::SELL, 100, 5)));        // duplicate id rejected while live
+    MatchResult c = m.submit(mk(7, Side::SELL, 0, 0, OrderType::CANCEL), tr);
+    CHECK(c.canceled);
+    CHECK(book.add(mk(7, Side::SELL, 102, 3)));         // id 7 free again -> re-add succeeds
+    CHECK(book.active_orders() == 1u);
+    REQUIRE(book.best_ask() != nullptr);
+    CHECK(book.best_ask()->price == 102);
+}
