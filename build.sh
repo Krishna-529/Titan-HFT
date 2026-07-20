@@ -15,7 +15,7 @@ mkdir -p build
     echo "== compiler =="
     "$CXX" --version | head -1
     echo "== compiling tests (ASan+UBSan) =="
-    if "$CXX" "${FLAGS[@]}" tests/tests.cpp tests/matcher_tests.cpp tests/rb_tree_tests.cpp tests/journaler_tests.cpp tests/sequencer_tests.cpp tests/tcp_gateway_tests.cpp -o build/titan_tests; then
+    if "$CXX" "${FLAGS[@]}" tests/tests.cpp tests/matcher_tests.cpp tests/rb_tree_tests.cpp tests/journaler_tests.cpp tests/sequencer_tests.cpp tests/tcp_gateway_tests.cpp tests/price_validation_tests.cpp -o build/titan_tests; then
         echo "COMPILE_OK"
         echo "== running tests =="
         ./build/titan_tests

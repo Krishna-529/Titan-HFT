@@ -124,6 +124,32 @@ public:
         return true;
     }
 
+    // --- Software-prefetch hints for a pipelined cancel stream (perf, not correctness) ---
+    // cancel() is TWO dependent cache misses: first locators_[id] (the id-slab -- 128 MB in the
+    // bench, indexed by a RANDOM id the hardware prefetcher can't predict), then nodes_[loc.node]
+    // (the node pool, indexed by a random node). A caller that knows the upcoming cancel ids -- a
+    // ring batch-drain, or the bench's op stream -- can hide BOTH misses the same way the ingress
+    // ring hides its cross-core coherence miss: prefetch AHEAD of use.
+    //
+    // Two-stage software pipeline:
+    //   prefetch_slab(id)  -- issued FURTHEST ahead: warm the id-slab line.
+    //   prefetch_node(id)  -- issued NEARER (its slab line is by now resident, so reading
+    //                         loc.node is cheap): warm the node's metadata line for remove().
+    //
+    // Both are hint-only: bounds-checked, no mutation, and harmless on a stale/dead id (the
+    // order may have been filled or cancelled since -- a wasted prefetch, never a fault). rw=1
+    // because cancel() writes both lines (clear_slot -> slab, remove() -> node metadata).
+    void prefetch_slab(OrderId id) const noexcept {
+        if (id < locators_.size())
+            __builtin_prefetch(&locators_[id], /*rw=*/1, /*locality=*/1);
+    }
+    void prefetch_node(OrderId id) const noexcept {
+        if (id >= locators_.size()) return;
+        const std::uint32_t node = locators_[id].node;   // hits L1/L2 if prefetch_slab ran earlier
+        if (node != INVALID_INDEX && node < nodes_.size())
+            __builtin_prefetch(&nodes_[node], /*rw=*/1, /*locality=*/1);
+    }
+
     // --- Top-of-book / introspection (read-only, noexcept) ---
     const PriceLevel* best_bid() const noexcept {
         return bids_.empty() ? nullptr : &bids_.begin()->second;

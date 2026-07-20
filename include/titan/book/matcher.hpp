@@ -64,6 +64,24 @@ public:
     template <class Sink>
     MatchResult submit(Order in, Sink& sink) noexcept {
         MatchResult r{};
+
+        // BOUNDARY GATE -- and the ONLY place a boundary rejection may be emitted.
+        //
+        // The gateway detects an out-of-bounds price earlier (net/tcp_gateway.hpp) and
+        // counts it, but it deliberately does NOT reject there: the egress ring is strictly
+        // SPSC and THIS thread is its sole producer. Emitting the reject from a gateway or
+        // sequencer thread would force egress to MPSC, taxing every valid fill with CAS
+        // contention to serve a rare invalid order. So the gateway forwards, and the
+        // rejection happens here, on the one thread that owns egress.
+        //
+        // The order is dropped without the book ever being touched -- no level is created,
+        // so a hostile price cannot cause tree sprawl or cache pollution in the price index.
+        if (!is_admissible(in)) {
+            r.residual = in.remaining;
+            emit_reject(sink, in, r);
+            return r;
+        }
+
         const Qty original = in.remaining;
         try {
             if (in.remaining != 0) {

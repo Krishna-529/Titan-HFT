@@ -123,6 +123,12 @@ public:
 
     std::uint16_t port() const noexcept { return bound_port_; }
 
+    // Count of orders this gateway saw carrying an inadmissible price. Observability only:
+    // these orders were still forwarded, and the matcher is what turns them into REJECTED
+    // events (see push() below for why the rejection cannot happen on this thread).
+    // Read it after run() returns, or from the gateway's own thread.
+    std::uint64_t rejected() const noexcept { return rejected_; }
+
     // Blocking event loop -- call from a dedicated thread. Returns once stop() wakes it.
     void run() noexcept {
         epoll_event events[MAX_EVENTS];
@@ -257,7 +263,23 @@ private:
 
     // Zero-drop push onto the inbound (MPSC) ring: busy-spin if it is momentarily full so no
     // order is ever dropped. Full is transient -- the Sequencer thread drains continuously.
+    //
+    // BOUNDARY CHECK: this is the earliest point at which the price is known, so an
+    // out-of-bounds order is DETECTED and COUNTED here -- but it is still FORWARDED, never
+    // dropped. Two reasons, both deliberate:
+    //
+    //   1. SPSC. The egress ring has exactly one producer: the matcher thread. This is a
+    //      gateway I/O thread and cannot emit the REJECTED event without promoting egress
+    //      to MPSC -- which would put CAS contention on every valid fill to serve a rare
+    //      invalid order. The matcher does the rejecting (see book/matcher.hpp).
+    //   2. A silent drop is a client-facing bug. A well-formed order carrying a bad price
+    //      still deserves an execution report; forwarding it is what lets the matcher
+    //      produce one.
+    //
+    // rejected_ is per-gateway and touched only by this gateway's own epoll thread, so it
+    // stays a plain counter -- no atomics, no sharing, nothing for TSan to flag.
     void push(const Order& o) noexcept {
+        if (!is_admissible(o)) ++rejected_;   // observability only -- the matcher rejects
         while (!inbound_.try_publish(o)) { /* backpressure: spin until the Sequencer frees a slot */ }
     }
 
@@ -266,6 +288,7 @@ private:
     int                            epoll_fd_   = -1;
     int                            stop_fd_    = -1;
     std::uint16_t                  bound_port_ = 0;
+    std::uint64_t                  rejected_   = 0;   // orders seen with an inadmissible price
     std::unordered_map<int, Conn>  conns_;   // one entry per live connection, not per order
 };
 
